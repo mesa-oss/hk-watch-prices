@@ -20,9 +20,19 @@ DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "listings.csv"
 
 COLUMNS = [
     "posted_at", "seller", "brand", "reference", "dial_color",
-    "year_made", "month_made", "condition", "full_set",
-    "price_hkd", "price_usdt", "raw_line", "source_file",
+    "year_made", "month_made", "year_label", "condition", "full_set",
+    "price_hkd", "price_usdt", "clean_line", "raw_line", "source_file",
 ]
+
+
+def _format_year_label(year, month):
+    if month and year:
+        return f"N{month}/{str(year)[-2:]}"
+    if year:
+        return str(year)
+    if month:
+        return f"N{month}"
+    return ""
 
 
 def main():
@@ -55,7 +65,9 @@ def main():
         where.append("posted_at >= ?")
         params.append(args.since)
 
-    sql = f"SELECT {', '.join(COLUMNS)} FROM listings"
+    # Note: year_label is computed in Python below, not stored in DB
+    db_cols = [c for c in COLUMNS if c != "year_label"]
+    sql = f"SELECT {', '.join(db_cols)} FROM listings"
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY posted_at DESC, brand, reference"
@@ -68,7 +80,13 @@ def main():
         writer = csv.writer(f)
         writer.writerow(COLUMNS)
         for r in rows:
-            writer.writerow([r[c] for c in COLUMNS])
+            row = []
+            for c in COLUMNS:
+                if c == "year_label":
+                    row.append(_format_year_label(r["year_made"], r["month_made"]))
+                else:
+                    row.append(r[c])
+            writer.writerow(row)
 
     print(f"Wrote {len(rows)} rows → {args.out}")
 

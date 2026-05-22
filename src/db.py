@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS listings (
     raw_message TEXT,
     source_file TEXT,
     confidence TEXT,
+    clean_line TEXT,
     UNIQUE(posted_at, seller, raw_line)
 );
 
@@ -58,11 +59,11 @@ def insert_listings(conn: sqlite3.Connection, listings: Iterable[Listing]) -> in
     INSERT OR IGNORE INTO listings (
         posted_at, seller, brand, reference, dial_color, year_made, month_made,
         condition, price_hkd, price_usdt, full_set, raw_line, raw_message,
-        source_file, confidence
+        source_file, confidence, clean_line
     ) VALUES (
         :posted_at, :seller, :brand, :reference, :dial_color, :year_made, :month_made,
         :condition, :price_hkd, :price_usdt, :full_set, :raw_line, :raw_message,
-        :source_file, :confidence
+        :source_file, :confidence, :clean_line
     )
     """
     rows = [asdict(l) for l in listings]

@@ -67,6 +67,8 @@ REFERENCE_PATTERNS = [
     re.compile(r"\b(\d{4,5}[A-Z]{2}\.[A-Z0-9]{2,4}\.[A-Z0-9]{4,8}\.\d{2})\b", re.I),
     # Patek slashed: 5160/500G, 5167/1A, 5712/1A, 5990/1R, 7118/1200R, 5719/10G
     re.compile(r"\b(\d{4}/\d{1,4}[A-Z]{1,3}(?:-\d{3})?)\b", re.I),
+    # Breguet hyphenated: 3661B-1954-55A, 5817BR-12-9V8, 7027BR-G9-9V6
+    re.compile(r"\b(\d{4}[A-Z]{1,2}-\d{1,4}-\d{1,3}[A-Z0-9]{0,3})\b", re.I),
     # AP, Patek, VC short: 26240ST, 5167R, 5711P, 15400OR, 77450BC, 89000
     re.compile(r"\b(\d{4,5}[A-Z]{1,3}(?:-\d{3,4})?)\b", re.I),
     # Cartier HPI / Vacheron VCARO etc
@@ -101,21 +103,50 @@ REFERENCE_PATTERNS = [
     re.compile(r"\b(\d{4})(?=[A-Za-z/])"),
 ]
 
-# Year-made hints: 2024, 2024y, 2024/12, 25/4 (Apr 2025), N5/26 (new May 2026)
-YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
-YEAR_SHORT_RE = re.compile(r"\b(\d{2})/(\d{1,2})\b")  # 24/11 = Nov 2024
-N_DATE_RE = re.compile(r"\bN\s?(\d{1,2})(?:[\.\/](\d{2,4}))?\b", re.I)  # N5/26
-N_ONLY_RE = re.compile(r"\bN(\d{1,2})\b")  # N5 (month, current year)
+# Year-made hints. Be STRICT — hyphens count as alphanumeric so ref-internal
+# digits (e.g. "1954" in "3661B-1954-55A") aren't grabbed. But allow an
+# optional `y`/`Y`/`year` shorthand suffix (dealers often write `2021y`).
+YEAR_RE = re.compile(
+    r"(?<![\w/\-])(19[89]\d|20[0-3]\d)"
+    r"(?:[Yy]|year|used|new|unworn)?"
+    r"(?![\w/\-])",
+    re.I,
+)
+N_DATE_RE = re.compile(r"\bN\s?(\d{1,2})[\.\/](\d{2,4})\b", re.I)  # N5/26 or N1.2026
+N_PLAIN_RE = re.compile(r"\bN(\d{1,2})\b(?![\.\/])", re.I)  # N5 (month only, current year)
+MONTH_NAME_RE = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[-\s]+(\d{4})\b",
+    re.I,
+)
+MONTH_YEAR_RE = re.compile(r"(?<![\w/\-])(\d{1,2})/(\d{4})(?![\w/\-])")  # 1/2026, 12/2024
+SHORT_YEAR_MONTH_RE = re.compile(r"(?<![\w/\-])(\d{2})/(\d{1,2})(?![\w/\-])")  # 25/3 = Mar 2025
 
-# Common dial / metal / color words that often appear
-COLOR_WORDS = {
-    "white", "black", "blue", "green", "grey", "gray", "silver", "gold",
-    "yellow", "pink", "salmon", "champ", "champagne", "brown", "purple",
-    "red", "orange", "ivory", "platinum", "steel", "rose", "tiffany",
-    "sky", "diamond", "ceramic", "rainbow", "naked", "aventurine", "panda",
-    "olive", "chocolate", "choco", "burgundy", "turquoise", "mop",
-    "iceblue", "ice", "rg", "wg", "yg", "pt", "rosegold",
+MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
+
+# Dial colors. Allow multi-word phrases. Listed longest-first so longer
+# matches win (e.g. "ice blue" before "blue", "rose gold" before "rose").
+COLOR_PHRASES = [
+    "salmon pink", "baby pink", "hot pink", "light pink", "dark pink",
+    "ice blue", "ice white", "iceblue",
+    "rose gold", "yellow gold", "white gold", "champ gold", "champagne",
+    "midnight blue", "navy blue", "dark blue", "light blue", "royal blue",
+    "racing green", "olive green", "dark green", "light green", "khaki green",
+    "tiffany blue", "tiffany",
+    "panda", "reverse panda",
+    "smoked grey", "fume", "fumé",
+    "two tone", "two-tone",
+    "diamond pave", "pave", "pavé", "full diamond", "rainbow",
+    "salmon", "olive", "khaki", "burgundy", "wine", "tropical", "patina",
+    "aventurine", "meteorite", "mother of pearl", "mop",
+    "white", "black", "blue", "green", "grey", "gray", "silver", "gold",
+    "yellow", "pink", "champ", "brown", "purple", "red", "orange", "ivory",
+    "platinum", "steel", "rose", "sky", "diamond", "ceramic", "chocolate",
+    "choco", "turquoise", "cream", "anthracite", "bronze", "copper",
+    "rg", "wg", "yg", "pt", "rosegold",
+]
 
 # Brand inference from reference patterns
 def infer_brand(reference: str, message_context: str = "") -> str | None:
@@ -211,10 +242,27 @@ class Listing:
     price_hkd: int | None
     price_usdt: int | None
     full_set: bool | None
-    raw_line: str
+    raw_line: str           # original line (with emojis) for verification
     raw_message: str = ""
     source_file: str = ""
     confidence: str = "regex"  # 'regex' or 'llm'
+    clean_line: str = ""    # emoji-stripped, normalized for display
+
+
+def format_month(year: int | None, month: int | None) -> str:
+    """Display year/month as 'N6/26', 'N1/26', or just '2024'.
+
+    The 'N' prefix indicates a sale-month indicator (typical dealer notation
+    for 'new delivered in MM/YY'). When only a year is known, returns the
+    plain year.
+    """
+    if month and year:
+        return f"N{month}/{str(year)[-2:]}"
+    if year:
+        return str(year)
+    if month:
+        return f"N{month}"
+    return ""
 
 
 def parse_price(text: str) -> tuple[int | None, int | None]:
@@ -296,9 +344,35 @@ def extract_price(line: str) -> tuple[int | None, int | None, str]:
             else:
                 if hkd is None:
                     hkd = int(amt)
-    # If we found neither, try a bare-number heuristic: 5-6 digit integer
+    # Fallback 1: a bare `<num>k` or `<num>m` suffix (no currency word) — these
+    # are HKD by default in HK price lists. e.g. "ref Black 2024 720k"
     if hkd is None and usdt is None:
-        for m in re.finditer(r"\b(\d{5,7})\b", line):
+        # Find numbers that aren't part of a reference (no letter immediately
+        # before the digits). Restrict to numbers followed by k/m at line/word end.
+        for m in re.finditer(
+            r"(?<![A-Za-z\-/])(\d+(?:[\.,]\d+)?)\s*([kKmM]|mil|MIL)\b",
+            line,
+        ):
+            amt_str = m.group(1).replace(",", "")
+            try:
+                amt = float(amt_str)
+            except ValueError:
+                continue
+            suf = m.group(2).lower()
+            if suf == "k":
+                amt *= 1_000
+            else:
+                amt *= 1_000_000
+            if amt >= 5000:
+                hkd = int(amt)
+                break
+
+    # Fallback 2: a 5-7 digit integer near the end of the line (likely an
+    # un-suffixed HKD price like "168000 HKD" or "150,000")
+    if hkd is None and usdt is None:
+        # Search ONLY in the second half of the line — refs are at the start
+        half = max(len(line) // 2, 1)
+        for m in re.finditer(r"\b(\d{5,7})\b", line[half:]):
             amt = int(m.group(1))
             if 5000 <= amt <= 50_000_000:
                 hkd = amt
@@ -321,69 +395,163 @@ def extract_condition(line: str) -> tuple[str | None, bool | None]:
 
 
 def extract_year_month(line: str) -> tuple[int | None, int | None]:
-    """Extract year-made and (optionally) month from the listing line.
+    """Extract year-made and month from the listing line.
 
-    Handles: 2024, 2024y, 2024/12, 25/3 (Mar 2025), N5/26 (new May 2026), N5 (May, current year).
+    Handles (in order of precedence):
+      - N5/26, n1.2026   → new + month + year
+      - Jan-2026, Feb 2024 → month name + year
+      - 1/2026, 12/2024  → month/year
+      - 25/3, 24/11      → year/month (yy/mm)
+      - 2024, 2024y      → bare year (only if not adjacent to hyphens/letters)
+
+    Critically: ref-internal digits like the "1954" in "3661B-1954-55A" are
+    NOT treated as years thanks to strict word-boundary lookarounds.
     """
-    # N5/26 form
-    m = re.search(r"\bN\s?(\d{1,2})[\.\/](\d{2,4})\b", line, re.I)
+    # 1. N5/26 form (new + month + year)
+    m = N_DATE_RE.search(line)
     if m:
         month = int(m.group(1))
         ystr = m.group(2)
         year = int(ystr) + 2000 if len(ystr) == 2 else int(ystr)
-        return year, month
-    # n5/26 lowercase already covered by re.I
+        if 1 <= month <= 12 and 1990 <= year <= 2040:
+            return year, month
 
-    # year/month form: 2024/12, 22/9, 25/3, 24/11
-    m = re.search(r"\b(\d{2,4})/(\d{1,2})\b(?!\d)", line)
+    # 2. Month-name form: Jan-2026, Feb 2024
+    m = MONTH_NAME_RE.search(line)
     if m:
-        ystr, mstr = m.group(1), m.group(2)
-        if len(ystr) == 4:
-            return int(ystr), int(mstr)
-        if len(ystr) == 2:
-            yy = int(ystr)
-            # 00-30 → 2000-2030, else skip
-            if yy <= 30:
-                return 2000 + yy, int(mstr)
+        month = MONTH_MAP[m.group(1).lower()[:3]]
+        year = int(m.group(2))
+        return year, month
 
-    # Bare 4-digit year
+    # 3. month/year form: 1/2026, 12/2024 (where the 4-digit side is the year)
+    m = MONTH_YEAR_RE.search(line)
+    if m:
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if 1 <= month <= 12 and 1990 <= year <= 2040:
+            return year, month
+
+    # 4. short yy/mm form: 25/3, 24/11 → Mar 2025, Nov 2024
+    m = SHORT_YEAR_MONTH_RE.search(line)
+    if m:
+        yy = int(m.group(1))
+        mm = int(m.group(2))
+        if yy <= 35 and 1 <= mm <= 12:
+            return 2000 + yy, mm
+
+    # 5. Bare 4-digit year — strict: not adjacent to digits/letters/hyphens
     m = YEAR_RE.search(line)
     if m:
-        return int(m.group(0)), None
+        return int(m.group(1)), None
+
     return None, None
 
 
+def extract_color(line: str) -> str | None:
+    """Find the dial color or material descriptor.
+
+    Tries multi-word phrases first ("ice blue", "rose gold") so we don't
+    truncate compound colors. Returns the matched phrase as-cased.
+    """
+    lo = line.lower()
+    best: tuple[int, str] | None = None  # (position, phrase)
+    for phrase in COLOR_PHRASES:
+        # Word-boundary match. For phrases with spaces, the boundary is at
+        # the phrase edges; the inner space is literal.
+        m = re.search(rf"\b{re.escape(phrase)}\b", lo)
+        if m:
+            pos = m.start()
+            # Prefer the LEFTMOST match. Among ties, longer phrase wins
+            # (because COLOR_PHRASES is ordered longest-first within each
+            # color family, the first match at the leftmost position will be
+            # the longest valid one).
+            if best is None or pos < best[0]:
+                best = (pos, phrase)
+    if best is None:
+        return None
+    # Title-case for display ("Ice Blue", "Rose Gold")
+    return " ".join(w.capitalize() for w in best[1].split())
+
+
+# Unicode emoji / pictograph ranges. Used to clean raw lines for display.
+_EMOJI_RE = re.compile(
+    "[" "\U0001F300-\U0001F6FF"  # symbols & pictographs, transport
+        "\U0001F700-\U0001F77F"
+        "\U0001F780-\U0001F7FF"
+        "\U0001F800-\U0001F8FF"
+        "\U0001F900-\U0001F9FF"  # supplemental symbols
+        "\U0001FA00-\U0001FA6F"
+        "\U0001FA70-\U0001FAFF"
+        "\U00002600-\U000027BF"  # misc symbols & dingbats
+        "\U0001F1E0-\U0001F1FF"  # flags
+        "\U0000FE0F"             # variation selector
+        "‍"                 # ZWJ
+        "]+", flags=re.UNICODE,
+)
+
+
+def strip_emojis(text: str) -> str:
+    """Remove emojis and clean up whitespace for human-readable display."""
+    cleaned = _EMOJI_RE.sub("", text)
+    # Collapse repeated whitespace, strip stray punctuation residue
+    cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
+    return cleaned
+
+
+_PRICE_MARKER_RE = re.compile(
+    r"(?:HKD|USDT|USD|\$|💰|prix|price|\bprice\b)",
+    re.I,
+)
+
+
+def _find_price_region_start(line: str) -> int:
+    """Return the index where the price portion of the line starts.
+
+    Refs live before the price; anything after the price marker is treated
+    as price noise and ignored during reference extraction.
+    """
+    m = _PRICE_MARKER_RE.search(line)
+    return m.start() if m else len(line)
+
+
 def extract_reference(line: str) -> str | None:
-    """Find the most specific reference match in the line."""
+    """Find the most specific reference, preferring matches BEFORE the price.
+
+    The user noted that the reference is almost always at the start of the
+    line; anything that looks like a reference but sits after `HKD`, `USDT`,
+    `$`, etc. is much more likely to be a price typo (e.g. `868000hkd`
+    matched as `8680`) and is rejected.
+    """
     # Strip leading emojis/symbols. Also collapse year-suffix "2022y" → "2022 "
     # so it doesn't get captured as reference "2022Y".
     clean = re.sub(r"^[^\w\d]+", "", line)
     clean = re.sub(r"\b((?:19|20)\d{2})[Yy]\b", r"\1 ", clean)
-    for pat in REFERENCE_PATTERNS:
+    price_start = _find_price_region_start(clean)
+
+    best: tuple[int, int, str] | None = None  # (pattern_priority, position, ref)
+    for pat_idx, pat in enumerate(REFERENCE_PATTERNS):
         for m in pat.finditer(clean):
             ref = m.group(1).upper()
-            # Reject pure 4-digit years (1990–2030) — they're never references on their own
+            pos = m.start()
+            # Skip refs that appear inside the price region
+            if pos >= price_start:
+                continue
+            # Reject pure 4-digit years (1990–2030)
             if re.fullmatch(r"(?:19[89]\d|20[0-3]\d)", ref):
                 continue
             # Reject leading-zero numerics
             if re.fullmatch(r"\d{5,7}", ref) and ref.startswith("0"):
                 continue
-            return ref
-    return None
-
-
-def extract_color(line: str) -> str | None:
-    lo = line.lower()
-    found = []
-    for w in COLOR_WORDS:
-        if re.search(rf"\b{re.escape(w)}\b", lo):
-            found.append(w)
-    # Pick the first match by position
-    if not found:
-        return None
-    positions = [(lo.find(w), w) for w in found]
-    positions.sort()
-    return positions[0][1].capitalize()
+            # Prefer the leftmost ref overall; ties broken by pattern priority
+            # (earlier patterns are more specific).
+            cand = (pos, pat_idx, ref)
+            if best is None:
+                best = cand
+            else:
+                # Strict "leftmost wins"; only on equal position prefer specific pattern
+                if cand[0] < best[0] or (cand[0] == best[0] and cand[1] < best[1]):
+                    best = cand
+    return best[2] if best else None
 
 
 def is_listing_line(line: str) -> bool:
@@ -443,6 +611,7 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
         raw_message=message_context[:500],
         source_file=source_file,
         confidence="regex",
+        clean_line=strip_emojis(line),
     )
 
 

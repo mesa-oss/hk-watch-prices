@@ -87,13 +87,34 @@ if seller:
 sql = f"""
 SELECT posted_at, seller, brand, reference, dial_color,
        year_made, month_made, condition, full_set,
-       price_hkd, price_usdt, raw_line
+       price_hkd, price_usdt, clean_line, raw_line
 FROM listings WHERE {' AND '.join(where)}
 ORDER BY posted_at DESC
 LIMIT 2000
 """
 
 df = pd.read_sql_query(sql, conn, params=params)
+
+# Build a friendly "year" label: "N5/26", "2024", or "" — matches dealer notation
+def _year_label(row):
+    y = row["year_made"]
+    m = row["month_made"]
+    if pd.notna(m) and pd.notna(y):
+        return f"N{int(m)}/{str(int(y))[-2:]}"
+    if pd.notna(y):
+        return str(int(y))
+    if pd.notna(m):
+        return f"N{int(m)}"
+    return ""
+
+if len(df):
+    df["year"] = df.apply(_year_label, axis=1)
+    # Reorder columns for readability; keep raw_line at the end for verification
+    df = df[[
+        "posted_at", "brand", "reference", "dial_color", "year",
+        "condition", "full_set", "price_hkd", "price_usdt",
+        "seller", "clean_line", "raw_line",
+    ]]
 
 # --- Summary block ---
 if len(df):

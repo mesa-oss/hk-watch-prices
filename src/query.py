@@ -144,18 +144,22 @@ def main():
         return
 
     # Compact tabular output
-    print(f"{'Posted':<19} {'Ref':<20} {'Cond':<5} {'Yr':<5} {'Color':<10} "
-          f"{'Price':<32} {'Seller':<20}")
-    print("-" * 120)
+    print(f"{'Posted':<19} {'Ref':<22} {'Cond':<5} {'Year':<7} {'Color':<14} "
+          f"{'Price':<32} {'Seller':<18}")
+    print("-" * 130)
     for r in rows:
         cond = (r["condition"] or "")[:5]
-        yr = str(r["year_made"]) if r["year_made"] else ""
-        if r["month_made"]:
-            yr = f"{yr}/{r['month_made']:02d}"
-        color = (r["dial_color"] or "")[:10]
-        seller = (r["seller"] or "")[:20]
-        print(f"{r['posted_at'][:19]:<19} {r['reference']:<20} {cond:<5} "
-              f"{yr:<5} {color:<10} {fmt_price(r['price_hkd'], r['price_usdt']):<32} {seller:<20}")
+        yr = ""
+        if r["month_made"] and r["year_made"]:
+            yr = f"N{r['month_made']}/{str(r['year_made'])[-2:]}"
+        elif r["year_made"]:
+            yr = str(r["year_made"])
+        elif r["month_made"]:
+            yr = f"N{r['month_made']}"
+        color = (r["dial_color"] or "")[:14]
+        seller = (r["seller"] or "")[:18]
+        print(f"{r['posted_at'][:19]:<19} {r['reference']:<22} {cond:<5} "
+              f"{yr:<7} {color:<14} {fmt_price(r['price_hkd'], r['price_usdt']):<32} {seller:<18}")
     print(f"\n({len(rows)} row{'s' if len(rows) != 1 else ''})")
 
 
