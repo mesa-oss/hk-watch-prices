@@ -338,7 +338,9 @@ def extract_price(line: str) -> tuple[int | None, int | None, str]:
                 # Bare number under 1000 is probably not a price unless followed by k/m
                 continue
             pat_src = pat.pattern.lower()
-            if "usdt" in pat_src or pat.pattern.startswith(r"\$"):
+            # In HK dealer lists "$" means HKD, not USD/USDT. Only the
+            # explicit USDT keyword represents the crypto stablecoin price.
+            if "usdt" in pat_src:
                 if usdt is None:
                     usdt = int(amt)
             else:
