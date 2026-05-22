@@ -108,16 +108,10 @@ def _year_label(row):
     return ""
 
 if len(df):
+    # Add the "N5/26"-style year label, but keep the raw year_made column so
+    # the scatter chart further down can still plot against it numerically.
     df["year"] = df.apply(_year_label, axis=1)
-    # Reorder columns for readability; keep raw_line at the end for verification
-    df = df[[
-        "posted_at", "brand", "reference", "dial_color", "year",
-        "condition", "full_set", "price_hkd", "price_usdt",
-        "seller", "clean_line", "raw_line",
-    ]]
 
-# --- Summary block ---
-if len(df):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Matches", f"{len(df):,}")
     hkd = df["price_hkd"].dropna()
@@ -127,17 +121,23 @@ if len(df):
         c3.metric("Min HKD", f"{int(hkd.min()):,}")
         c4.metric("Max HKD", f"{int(hkd.max()):,}")
 
-    # Quick chart: price by year
+    # Quick chart: price by year (uses raw numeric year_made column)
     if len(hkd) > 5 and df["year_made"].notna().sum() > 5:
         st.subheader("HKD price by year made")
         chart = df.dropna(subset=["price_hkd", "year_made"])
         st.scatter_chart(chart, x="year_made", y="price_hkd", color="brand")
 
+    # Build a display-only view that hides the raw year_made/month_made columns
+    display_df = df[[
+        "posted_at", "brand", "reference", "dial_color", "year",
+        "condition", "full_set", "price_hkd", "price_usdt",
+        "seller", "clean_line", "raw_line",
+    ]]
     st.subheader("Listings")
-    st.dataframe(df, width="stretch", height=600)
+    st.dataframe(display_df, width="stretch", height=600)
     st.download_button(
         "Download filtered CSV",
-        df.to_csv(index=False).encode("utf-8"),
+        display_df.to_csv(index=False).encode("utf-8"),
         "filtered_listings.csv",
         "text/csv",
     )
