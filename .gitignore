@@ -1,0 +1,16 @@
+# Raw WhatsApp exports — contain private group conversations, do not commit
+exports/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated CSVs / spreadsheets (regenerate from DB)
+data/*.csv
+data/*.xlsx
+data/~$*
+
+# OS
+.DS_Store

@@ -1,0 +1,8 @@
+# Core: nothing — parser, db, query all use stdlib only
+
+# Web UI
+streamlit>=1.30
+pandas>=2.0
+
+# Optional LLM fallback for unparsed lines
+anthropic>=0.30
