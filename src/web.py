@@ -10,7 +10,6 @@ Run with:
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from pathlib import Path
 
@@ -119,11 +118,24 @@ if brand:
     where.append("brand = ?")
     params.append(brand)
 if color:
-    where.append("dial_color LIKE ? COLLATE NOCASE")
-    params.append(f"%{color}%")
+    # Broad search: color filter matches dial_color OR dial_details OR the
+    # cleaned description. Typing 'grey' will surface any row mentioning grey,
+    # not just the ones where the parser tagged dial_color = 'grey'.
+    where.append(
+        "(dial_color LIKE ? COLLATE NOCASE "
+        "OR dial_details LIKE ? COLLATE NOCASE "
+        "OR clean_line LIKE ? COLLATE NOCASE)"
+    )
+    needle = f"%{color}%"
+    params.extend([needle, needle, needle])
 if details:
-    where.append("dial_details LIKE ? COLLATE NOCASE")
-    params.append(f"%{details}%")
+    # Same broadening so 'diamond' / 'roman' filter matches wherever the
+    # word appears in the description.
+    where.append(
+        "(dial_details LIKE ? COLLATE NOCASE OR clean_line LIKE ? COLLATE NOCASE)"
+    )
+    needle = f"%{details}%"
+    params.extend([needle, needle])
 where.append("(year_made IS NULL OR year_made BETWEEN ? AND ?)")
 params.extend([year_min, year_max])
 if condition != "any":
@@ -193,72 +205,17 @@ def fmt_dial(color, details) -> str:
     return " · ".join(parts)
 
 
-def fmt_description(clean: str, ref: str, color, details, year, month) -> str:
-    """Cleaned dealer line with everything that's already shown in other
-    columns stripped out: ref, price tokens, color, details, year, month.
-
-    What remains: dial-specific descriptors that aren't in our structured
-    columns (e.g. 'Eisenkiesel', 'fullset', 'card only', 'tropical patina',
-    edition numbers, references to bracelet vs leather).
-    """
-    if not isinstance(clean, str) or not clean:
-        return ""
-    out = clean
-    # Strip the reference token
-    if ref:
-        out = re.sub(rf"\b{re.escape(ref)}\b", "", out, flags=re.IGNORECASE)
-    # Strip explicit price markers
-    out = re.sub(
-        r"\b(?:HKD|USDT|USD)\s*:?\s*\d[\d,\.]*\s*(?:k|m|mil)?\b|"
-        r"\$\s?\d[\d,\.]*\s*(?:k|m|mil)?",
-        "", out, flags=re.IGNORECASE,
-    )
-    # Strip bare price suffixes that have no currency word ("720k", "1.5m"
-    # when those came from numbers we already parsed as the price)
-    out = re.sub(r"\b\d[\d,\.]*\s*(?:k|K|m|M|mil)\b", "", out)
-    # Strip the year (e.g. "2024", "2024y")
-    if pd.notna(year):
-        out = re.sub(rf"\b{int(year)}(?:y|year|used|new)?\b", "", out, flags=re.IGNORECASE)
-    # Strip the N-month marker (e.g. "N5", "N5/26", "n12")
-    if pd.notna(month):
-        out = re.sub(
-            rf"\bN\s?{int(month)}(?:[\.\/]\d{{2,4}})?\b", "", out, flags=re.IGNORECASE,
-        )
-    # Strip the color phrase (case-insensitive whole-word)
-    if pd.notna(color) and color:
-        out = re.sub(rf"\b{re.escape(str(color))}\b", "", out, flags=re.IGNORECASE)
-    # Strip detail keywords we already capture (diamond/pave/roman/etc.)
-    if pd.notna(details) and details:
-        for word in str(details).replace(",", " ").split():
-            if len(word) >= 3:
-                out = re.sub(rf"\b{re.escape(word)}\b", "", out, flags=re.IGNORECASE)
-        # Common synonyms not in the canonical label but worth stripping too
-        out = re.sub(r"\b(diamonds?|pav[eé]d?|roman|indices|baguette|rainbow)\b",
-                     "", out, flags=re.IGNORECASE)
-    # Strip condition words now-superseded by the structured fields
-    out = re.sub(r"\b(used|new|naked|brand[- ]?new|unworn|unused|like new|"
-                 r"fullset|full set|full[- ]?set|watch[- ]?only)\b",
-                 "", out, flags=re.IGNORECASE)
-    # Squash leftover whitespace/punctuation residue
-    out = re.sub(r"\s{2,}", " ", out)
-    out = re.sub(r"^[\s,.:·;|()/-]+|[\s,.:·;|()/-]+$", "", out)
-    return out
-
-
 # ----- Compact mobile table -----
 if len(df):
     df["Ref"] = df["reference"]
     df["Year"] = df["year_made"].apply(fmt_year)
     df["N"] = df["month_made"].apply(fmt_month)
     df["Dial"] = df.apply(lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1)
-    df["Description"] = df.apply(
-        lambda r: fmt_description(
-            r["clean_line"], r["reference"],
-            r["dial_color"], r["dial_details"],
-            r["year_made"], r["month_made"],
-        ),
-        axis=1,
-    )
+    # Description = the full cleaned dealer line. The user explicitly wants
+    # the raw text visible so anything the parser didn't pick up (panda dial,
+    # tropical patina, bracelet vs leather, edition numbers, etc.) is still
+    # available for eyeballing.
+    df["Description"] = df["clean_line"].fillna("")
     df["Price"] = df.apply(lambda r: fmt_price(r["price_hkd"], r["price_usdt"]), axis=1)
 
     # Compact metrics in a single row
