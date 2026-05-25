@@ -247,6 +247,7 @@ class Listing:
     source_file: str = ""
     confidence: str = "regex"  # 'regex' or 'llm'
     clean_line: str = ""    # emoji-stripped, normalized for display
+    dial_details: str | None = None  # diamond / roman / pavé / etc.
 
 
 def format_month(year: int | None, month: int | None) -> str:
@@ -312,13 +313,13 @@ def extract_price(line: str) -> tuple[int | None, int | None, str]:
     """Extract price and return (hkd, usdt, matched_chunk)."""
     # Greedy: look for explicit HKD/USDT/$ markers first
     pats = [
-        re.compile(r"(?:HKD|hkd)\s*:?\s*(\d+(?:[\.,]\d+)?)\s*(k|m|mil)?", re.I),
-        re.compile(r"(\d+(?:[\.,]\d+)?)\s*(k|m|mil)?\s*(?:HKD|hkd)", re.I),
-        re.compile(r"(?:USDT|usdt)\s*:?\s*(\d+(?:[\.,]\d+)?)\s*(k|m|mil)?", re.I),
-        re.compile(r"(\d+(?:[\.,]\d+)?)\s*(k|m|mil)?\s*(?:USDT|usdt)", re.I),
-        re.compile(r"\$\s*(\d+(?:[\.,]\d+)?)\s*(k|m|mil)?", re.I),
-        re.compile(r"💰\s*(\d+(?:[\.,]\d+)?)\s*(k|m|mil)?", re.I),
-        re.compile(r"price[\s:]+(\d+(?:[\.,]\d+)?)\s*(k|m|mil)?", re.I),
+        re.compile(r"(?:HKD|hkd)\s*:?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
+        re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?\s*(?:HKD|hkd)", re.I),
+        re.compile(r"(?:USDT|usdt)\s*:?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
+        re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?\s*(?:USDT|usdt)", re.I),
+        re.compile(r"\$\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
+        re.compile(r"💰\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
+        re.compile(r"price[\s:]+(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
     ]
     hkd = None
     usdt = None
@@ -352,7 +353,7 @@ def extract_price(line: str) -> tuple[int | None, int | None, str]:
         # Find numbers that aren't part of a reference (no letter immediately
         # before the digits). Restrict to numbers followed by k/m at line/word end.
         for m in re.finditer(
-            r"(?<![A-Za-z\-/])(\d+(?:[\.,]\d+)?)\s*([kKmM]|mil|MIL)\b",
+            r"(?<![A-Za-z\-/])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*([kKmM]|mil|MIL)\b",
             line,
         ):
             amt_str = m.group(1).replace(",", "")
@@ -492,6 +493,56 @@ _EMOJI_RE = re.compile(
 )
 
 
+# Distinguishing dial / case features beyond color. Two refs with the same
+# color but different details (e.g. "5167R Black" vs "5167R Black diamond
+# bezel") are meaningfully different watches; we record those features in a
+# separate column so they don't pollute the color cell.
+#
+# Order matters: longer/more-specific phrases first so e.g. "full pave" beats
+# "pave".
+DETAIL_PATTERNS = [
+    # Diamond / pavé variants — these dominate value differences
+    (re.compile(r"\bfull[- ]?pav[eé]\b|\bfully[- ]?pav[eé]d?\b", re.I), "Full Pavé"),
+    (re.compile(r"\bfactory[- ]?diamond\b|\bfactory[- ]?pav[eé]\b", re.I), "Factory Diamond"),
+    (re.compile(r"\baftermarket[- ]?diamond\b|\baftermarket[- ]?pav[eé]\b", re.I), "Aftermarket Diamond"),
+    (re.compile(r"\bdiamond[- ]?bezel\b|\bdiamond[- ]?dial\b", re.I), "Diamond"),
+    (re.compile(r"\bpav[eé]d?\b|\bpave\b", re.I), "Pavé"),
+    (re.compile(r"\bfull[- ]?diamond\b|\biced[- ]?out\b", re.I), "Full Diamond"),
+    (re.compile(r"💎|\bdiamonds?\b", re.I), "Diamond"),
+    (re.compile(r"\brainbow\b|🌈", re.I), "Rainbow"),
+    # Indices vs Roman numerals — distinct dial layouts
+    (re.compile(r"\broman\b|\brom\b(?!an)", re.I), "Roman"),
+    (re.compile(r"\bbaguette\b|\bbag\b(?![a-z])", re.I), "Baguette"),
+    (re.compile(r"\bindic(?:es|ies)\b|\bindex\b|\bbar[- ]?markers?\b|\bhour[- ]?markers?\b",
+                re.I), "Indices"),
+    # Limited / boutique / special editions
+    (re.compile(r"\blimited\b|\bltd\b\s?\d+|\bbespoke\b|\bunique\s?pieces?\b", re.I), "Limited"),
+    (re.compile(r"\bboutique\b", re.I), "Boutique"),
+    (re.compile(r"\btiffany[- ]?stamped?\b", re.I), "Tiffany-stamped"),
+    # Movement / case material highlights (only when notable)
+    (re.compile(r"\bskeleton\b", re.I), "Skeleton"),
+    (re.compile(r"\btourbillon\b", re.I), "Tourbillon"),
+]
+
+
+def extract_dial_details(line: str) -> str | None:
+    """Return a short, comma-separated string of distinguishing features.
+
+    Examples: 'Diamond', 'Pavé, Roman', 'Full Diamond, Limited'.
+    Returns None when nothing notable is found.
+
+    Patterns are applied longest-first; matched text is masked out before
+    the next pattern, so 'Full Pavé' won't also fire the bare 'Pavé' rule.
+    """
+    masked = line
+    found: list[str] = []
+    for pat, label in DETAIL_PATTERNS:
+        if pat.search(masked) and label not in found:
+            found.append(label)
+            masked = pat.sub(" ", masked)
+    return ", ".join(found) if found else None
+
+
 def strip_emojis(text: str) -> str:
     """Remove emojis and clean up whitespace for human-readable display."""
     cleaned = _EMOJI_RE.sub("", text)
@@ -595,6 +646,7 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
             condition = "used"
     year, month = extract_year_month(line)
     color = extract_color(line)
+    details = extract_dial_details(line)
     brand = infer_brand(ref, message_context)
 
     return Listing(
@@ -614,6 +666,7 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
         source_file=source_file,
         confidence="regex",
         clean_line=strip_emojis(line),
+        dial_details=details,
     )
 
 
