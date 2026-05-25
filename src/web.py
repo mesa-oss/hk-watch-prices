@@ -10,6 +10,7 @@ Run with:
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -182,14 +183,27 @@ def fmt_price(hkd, usdt) -> str:
     return ""
 
 
-def fmt_dial(color, details) -> str:
-    """Color + details, e.g. 'Black · Diamond' or 'Salmon · Pavé, Roman'."""
-    parts = []
-    if pd.notna(color) and color:
-        parts.append(color)
-    if pd.notna(details) and details:
-        parts.append(details)
-    return " · ".join(parts)
+def fmt_description(clean: str, ref: str, hkd, usdt) -> str:
+    """Cleaned dealer line, with reference and price token stripped so the
+    column doesn't repeat info already shown in adjacent cells.
+    """
+    if not isinstance(clean, str) or not clean:
+        return ""
+    out = clean
+    # Strip the reference token (it's already in the Ref column). Use word
+    # boundaries that allow hyphens/slashes inside the ref.
+    if ref:
+        out = re.sub(rf"\b{re.escape(ref)}\b", "", out, flags=re.IGNORECASE)
+    # Strip explicit price markers ("HKD 535,000", "USDT 80k", "$868K")
+    out = re.sub(
+        r"\b(?:HKD|USDT|USD)\s*:?\s*\d[\d,\.]*\s*(?:k|m|mil)?\b|"
+        r"\$\s?\d[\d,\.]*\s*(?:k|m|mil)?",
+        "", out, flags=re.IGNORECASE,
+    )
+    # Squash leftover whitespace/punctuation residue
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"^[\s,.:·;|]+|[\s,.:·;|]+$", "", out)
+    return out
 
 
 # ----- Compact mobile table -----
@@ -197,7 +211,11 @@ if len(df):
     df["Year"] = df.apply(lambda r: fmt_year(r["year_made"], r["month_made"]), axis=1)
     df["Price"] = df.apply(lambda r: fmt_price(r["price_hkd"], r["price_usdt"]), axis=1)
     df["Cond"] = df["condition"].fillna("").str.slice(0, 4)
-    df["Dial"] = df.apply(lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1)
+    df["Description"] = df.apply(
+        lambda r: fmt_description(r["clean_line"], r["reference"],
+                                  r["price_hkd"], r["price_usdt"]),
+        axis=1,
+    )
     df["Ref"] = df["reference"]
 
     # Compact metrics in a single row
@@ -211,7 +229,9 @@ if len(df):
     else:
         st.caption(f"{len(df):,} matches · prices in HKD")
 
-    compact = df[["Ref", "Year", "Cond", "Dial", "Price"]]
+    # Five-column compact view. Description (cleaned dealer line minus ref &
+    # price) is widest so the watch-specific text gets the most space.
+    compact = df[["Ref", "Year", "Cond", "Description", "Price"]]
     st.dataframe(
         compact,
         width="stretch",
@@ -221,12 +241,12 @@ if len(df):
             "Ref": st.column_config.TextColumn(width="small"),
             "Year": st.column_config.TextColumn(width="small"),
             "Cond": st.column_config.TextColumn(width="small"),
-            "Dial": st.column_config.TextColumn(width="medium"),
+            "Description": st.column_config.TextColumn(width="large"),
             "Price": st.column_config.TextColumn(width="small"),
         },
     )
 
-    with st.expander("Show full details (brand, seller, raw line)"):
+    with st.expander("Show full row (brand, seller, raw line)"):
         full = df[[
             "reference", "brand", "Year", "dial_color", "dial_details",
             "Cond", "full_set", "price_hkd", "price_usdt", "seller",

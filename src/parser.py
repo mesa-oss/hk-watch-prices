@@ -447,6 +447,15 @@ def extract_year_month(line: str) -> tuple[int | None, int | None]:
     if m:
         return int(m.group(1)), None
 
+    # 6. Bare 'N5' / 'n12' standalone — month-only notation common in dealer
+    # lists ("Newly arrived in month 5", year implied). We record month but
+    # leave year null since it's not explicit.
+    m = N_PLAIN_RE.search(line)
+    if m:
+        mm = int(m.group(1))
+        if 1 <= mm <= 12:
+            return None, mm
+
     return None, None
 
 
