@@ -119,20 +119,20 @@ if brand:
     params.append(brand)
 if color:
     # Broad search: color filter matches dial_color OR dial_details OR the
-    # cleaned description. Typing 'grey' will surface any row mentioning grey,
-    # not just the ones where the parser tagged dial_color = 'grey'.
+    # original raw description. Typing 'grey' will surface any row
+    # mentioning grey anywhere, not just rows tagged dial_color='grey'.
     where.append(
         "(dial_color LIKE ? COLLATE NOCASE "
         "OR dial_details LIKE ? COLLATE NOCASE "
-        "OR clean_line LIKE ? COLLATE NOCASE)"
+        "OR raw_line LIKE ? COLLATE NOCASE)"
     )
     needle = f"%{color}%"
     params.extend([needle, needle, needle])
 if details:
-    # Same broadening so 'diamond' / 'roman' filter matches wherever the
-    # word appears in the description.
+    # Same broadening so 'diamond' / 'roman' / 'panda' matches wherever the
+    # word appears in the original line.
     where.append(
-        "(dial_details LIKE ? COLLATE NOCASE OR clean_line LIKE ? COLLATE NOCASE)"
+        "(dial_details LIKE ? COLLATE NOCASE OR raw_line LIKE ? COLLATE NOCASE)"
     )
     needle = f"%{details}%"
     params.extend([needle, needle])
@@ -158,7 +158,7 @@ order_clause = {
 sql = f"""
 SELECT posted_at, seller, brand, reference, dial_color, dial_details,
        year_made, month_made, condition, full_set,
-       price_hkd, price_usdt, clean_line
+       price_hkd, price_usdt, clean_line, raw_line
 FROM listings
 WHERE {' AND '.join(where)}
 ORDER BY {order_clause}
@@ -211,11 +211,11 @@ if len(df):
     df["Year"] = df["year_made"].apply(fmt_year)
     df["N"] = df["month_made"].apply(fmt_month)
     df["Dial"] = df.apply(lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1)
-    # Description = the full cleaned dealer line. The user explicitly wants
-    # the raw text visible so anything the parser didn't pick up (panda dial,
-    # tropical patina, bracelet vs leather, edition numbers, etc.) is still
-    # available for eyeballing.
-    df["Description"] = df["clean_line"].fillna("")
+    # Description = the FULL original dealer line (raw_line), with nothing
+    # stripped or normalized. The user wants every detail visible — panda
+    # dial, tropical patina, bracelet vs leather, edition numbers, stickers,
+    # diamond placement, etc. — even if it means some emoji clutter.
+    df["Description"] = df["raw_line"].fillna("")
     df["Price"] = df.apply(lambda r: fmt_price(r["price_hkd"], r["price_usdt"]), axis=1)
 
     # Compact metrics in a single row
