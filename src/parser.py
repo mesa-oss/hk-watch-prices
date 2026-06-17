@@ -248,6 +248,8 @@ class Listing:
     confidence: str = "regex"  # 'regex' or 'llm'
     clean_line: str = ""    # emoji-stripped, normalized for display
     dial_details: str | None = None  # diamond / roman / pavé / etc.
+    metal: str | None = None    # decoded from Rolex 6th digit (Steel, RG, ...)
+    nickname: str | None = None  # YML → Pikachu, PN → Paul Newman
 
 
 def format_month(year: int | None, month: int | None) -> str:
@@ -552,6 +554,81 @@ def extract_dial_details(line: str) -> str | None:
     return ", ".join(found) if found else None
 
 
+# ---------------------------------------------------------------------------
+# Rolex legend (user-provided knowledge)
+# ---------------------------------------------------------------------------
+# The 6th (last) digit of a modern Rolex reference encodes the case metal.
+# Only valid when reference begins with the Rolex 6-digit pattern.
+ROLEX_METAL_MAP = {
+    "0": "Steel",
+    "1": "2T Rose Gold",
+    "2": "Steel & Platinum",
+    "3": "2T Yellow Gold",
+    "4": "Steel & WG Bezel",
+    "5": "Rose Gold",
+    "6": "Platinum",
+    "7": "Titanium",
+    "8": "Yellow Gold",
+    "9": "White Gold",
+}
+
+# Dial / bezel feature codes that some dealers append to the reference.
+# Rolex-specific — for Patek/AP/VC the same letter often means a metal
+# (e.g. Patek G = white gold), so we only apply this when the brand is Rolex.
+# Order matters: longest first so 'NG' matches before 'G'.
+ROLEX_DIAL_CODES = [
+    ("TBR", "Trapeze Brilliant Bezel"),
+    ("RBR", "Round Brilliant Bezel"),
+    ("NG", "MOP + 10 Diamonds"),
+    ("VI", "Diamonds at 6"),
+    ("A",  "Baguette Indexes"),
+    ("G",  "10 Diamonds"),
+]
+
+# Dealer nicknames → canonical names. Recognized in the raw line so a
+# search for 'Pikachu' or 'Paul Newman' surfaces YML/PN abbreviations.
+NICKNAMES = {
+    "YML": "Pikachu",
+    "PN": "Paul Newman",
+}
+
+
+def decode_rolex_ref(reference: str, brand: str | None) -> tuple[str | None, str | None]:
+    """Decode (metal, dial_feature) from a Rolex reference.
+
+    Returns (None, None) when reference is not Rolex or doesn't follow the
+    6-digit + optional suffix pattern. The metal comes from the 6th digit;
+    the dial feature comes from any A/G/Ng/Vi/RBR/TBR suffix.
+    """
+    if brand != "Rolex" or not reference:
+        return None, None
+    m = re.match(r"^(\d{6})([A-Z]{1,3})?$", reference.upper())
+    if not m:
+        return None, None
+    digits, suffix = m.group(1), (m.group(2) or "")
+    metal = ROLEX_METAL_MAP.get(digits[-1])
+    dial_feature = None
+    if suffix:
+        for code, label in ROLEX_DIAL_CODES:
+            if suffix == code:
+                dial_feature = label
+                break
+    return metal, dial_feature
+
+
+def extract_nickname(line: str) -> str | None:
+    """Return the canonical nickname when an abbreviation appears in the line.
+
+    e.g. 'YML green' → 'Pikachu'. Match is whole-word, case-sensitive (YML is
+    distinctive enough that lowercase 'yml' is rare and we don't want to
+    accidentally fire on common letter sequences in random words).
+    """
+    for code, name in NICKNAMES.items():
+        if re.search(rf"\b{re.escape(code)}\b", line):
+            return name
+    return None
+
+
 def strip_emojis(text: str) -> str:
     """Remove emojis and clean up whitespace for human-readable display."""
     cleaned = _EMOJI_RE.sub("", text)
@@ -657,6 +734,16 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
     color = extract_color(line)
     details = extract_dial_details(line)
     brand = infer_brand(ref, message_context)
+    metal, dial_feature = decode_rolex_ref(ref, brand)
+    # If the Rolex suffix unlocks a distinguishing dial feature, fold it
+    # into dial_details so it shows up in the Dial column.
+    if dial_feature:
+        if details:
+            if dial_feature not in details:
+                details = f"{details}, {dial_feature}"
+        else:
+            details = dial_feature
+    nickname = extract_nickname(line)
 
     return Listing(
         posted_at=posted_at,
@@ -676,6 +763,8 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
         confidence="regex",
         clean_line=strip_emojis(line),
         dial_details=details,
+        metal=metal,
+        nickname=nickname,
     )
 
 

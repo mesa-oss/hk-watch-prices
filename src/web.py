@@ -112,8 +112,16 @@ with st.expander("More filters", expanded=False):
 where = ["1=1"]
 params: list = []
 if ref:
-    where.append("reference LIKE ? COLLATE NOCASE")
-    params.append(f"%{ref}%")
+    # Reference filter also matches nicknames (typing "Pikachu" surfaces
+    # YML rows; typing "Paul Newman" surfaces PN rows). Falls back to the
+    # raw line so partial matches like "126508" still work.
+    where.append(
+        "(reference LIKE ? COLLATE NOCASE "
+        "OR nickname LIKE ? COLLATE NOCASE "
+        "OR raw_line LIKE ? COLLATE NOCASE)"
+    )
+    needle = f"%{ref}%"
+    params.extend([needle, needle, needle])
 if brand:
     where.append("brand = ?")
     params.append(brand)
@@ -157,7 +165,7 @@ order_clause = {
 
 sql = f"""
 SELECT posted_at, seller, brand, reference, dial_color, dial_details,
-       year_made, month_made, condition, full_set,
+       metal, nickname, year_made, month_made, condition, full_set,
        price_hkd, price_usdt, clean_line, raw_line
 FROM listings
 WHERE {' AND '.join(where)}
@@ -207,9 +215,17 @@ def fmt_dial(color, details) -> str:
 
 # ----- Compact mobile table -----
 if len(df):
-    df["Ref"] = df["reference"]
+    # Ref shows the reference; if a nickname was detected (YML, PN, ...) we
+    # append it in parens so the user can scan for it visually.
+    def _fmt_ref(row):
+        ref = row["reference"]
+        nick = row["nickname"]
+        return f"{ref} ({nick})" if isinstance(nick, str) and nick else ref
+
+    df["Ref"] = df.apply(_fmt_ref, axis=1)
     df["Year"] = df["year_made"].apply(fmt_year)
     df["N"] = df["month_made"].apply(fmt_month)
+    df["Metal"] = df["metal"].fillna("")
     df["Dial"] = df.apply(lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1)
     # Description = the FULL original dealer line (raw_line), with nothing
     # stripped or normalized. The user wants every detail visible — panda
@@ -229,9 +245,10 @@ if len(df):
     else:
         st.caption(f"{len(df):,} matches · prices in HKD")
 
-    # Six-column view. Year and N are separate so a row can show
-    # year=2026 + N=N5 simultaneously without combining notation.
-    compact = df[["Ref", "Year", "N", "Dial", "Description", "Price"]]
+    # Seven-column view. Metal (decoded from Rolex 6th digit) and the
+    # color-plus-details Dial column are separate so the user can scan both
+    # case material and dial features at a glance.
+    compact = df[["Ref", "Year", "N", "Metal", "Dial", "Description", "Price"]]
     st.dataframe(
         compact,
         width="stretch",
@@ -241,6 +258,8 @@ if len(df):
             "Ref": st.column_config.TextColumn(width="small"),
             "Year": st.column_config.TextColumn(width="small"),
             "N": st.column_config.TextColumn(width="small", help="Newly-delivered month"),
+            "Metal": st.column_config.TextColumn(width="small",
+                help="Case metal decoded from Rolex 6th digit"),
             "Dial": st.column_config.TextColumn(width="medium"),
             "Description": st.column_config.TextColumn(width="large"),
             "Price": st.column_config.TextColumn(width="small"),
@@ -249,9 +268,9 @@ if len(df):
 
     with st.expander("Show full row (brand, seller, condition, raw line)"):
         full = df[[
-            "reference", "brand", "Year", "N", "dial_color", "dial_details",
-            "condition", "full_set", "price_hkd", "price_usdt", "seller",
-            "posted_at", "clean_line",
+            "reference", "nickname", "brand", "Year", "N", "metal",
+            "dial_color", "dial_details", "condition", "full_set",
+            "price_hkd", "price_usdt", "seller", "posted_at", "raw_line",
         ]]
         st.dataframe(full, width="stretch", hide_index=True)
         st.download_button(
