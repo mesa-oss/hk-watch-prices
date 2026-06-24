@@ -96,6 +96,50 @@ def is_export_loaded(conn: sqlite3.Connection, source_file: str) -> bool:
     return cur.fetchone() is not None
 
 
+def vacuum(conn: sqlite3.Connection) -> None:
+    """Reclaim space freed by DELETEs. SQLite doesn't shrink the file
+    automatically; after a dedup pass the file can carry ~70% empty pages.
+    Required before committing the .db to a Git repo with a size limit.
+    """
+    conn.execute("VACUUM")
+    conn.commit()
+
+
+def dedup_repeated_listings(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Collapse identical listings re-posted by the same seller.
+
+    Dealers (e.g. Lisa Watch) re-post the same stock list every few hours.
+    When the seller, reference, dial color, dial details, year, month,
+    condition, full-set flag, and both prices all match, only the most
+    recent row is kept.
+
+    Returns (rows_before, rows_after).
+    """
+    before = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+    conn.execute(
+        """
+        DELETE FROM listings
+        WHERE id NOT IN (
+            SELECT MAX(id) FROM listings
+            GROUP BY
+                seller,
+                COALESCE(reference, ''),
+                COALESCE(dial_color, ''),
+                COALESCE(dial_details, ''),
+                COALESCE(year_made, 0),
+                COALESCE(month_made, 0),
+                COALESCE(condition, ''),
+                COALESCE(full_set, -1),
+                COALESCE(price_hkd, 0),
+                COALESCE(price_usdt, 0)
+        )
+        """
+    )
+    conn.commit()
+    after = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+    return before, after
+
+
 def stats(conn: sqlite3.Connection) -> dict:
     cur = conn.execute("SELECT COUNT(*) FROM listings")
     total = cur.fetchone()[0]

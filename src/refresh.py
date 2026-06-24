@@ -14,7 +14,10 @@ import sys
 from pathlib import Path
 
 from parser import parse_export
-from db import connect, insert_listings, mark_export_loaded, is_export_loaded, stats
+from db import (
+    connect, insert_listings, mark_export_loaded, is_export_loaded,
+    dedup_repeated_listings, vacuum, stats,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 EXPORTS_DIR = ROOT / "exports"
@@ -71,6 +74,16 @@ def main():
 
     print()
     print(f"Done. Inserted {total} new rows total.")
+
+    # Collapse repeated listings — dealers cross-post identical stock lines
+    # every few hours. We keep the latest row per (seller + structured
+    # listing fields) tuple.
+    before, after = dedup_repeated_listings(conn)
+    if before != after:
+        print(f"Dedup removed {before - after:,} repeated listings ({before:,} → {after:,}).")
+    # Reclaim space from deleted rows — otherwise the .db file keeps
+    # growing on every refresh even though row count goes down.
+    vacuum(conn)
     print()
     s = stats(conn)
     print(f"DB now has {s['total_listings']} listings, "

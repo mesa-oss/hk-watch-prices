@@ -108,7 +108,7 @@ REFERENCE_PATTERNS = [
 # optional `y`/`Y`/`year` shorthand suffix (dealers often write `2021y`).
 YEAR_RE = re.compile(
     r"(?<![\w/\-])(19[89]\d|20[0-3]\d)"
-    r"(?:[Yy]|year|used|new|unworn)?"
+    r"(?:yrs?|years?|y|used|new|unworn)?"
     r"(?![\w/\-])",
     re.I,
 )
