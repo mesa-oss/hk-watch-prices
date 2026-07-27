@@ -11,15 +11,18 @@ Run with:
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "watches.db"
+# Ensure src/ is importable when Streamlit runs this file directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from paths import db_path  # noqa: E402
 
 st.set_page_config(
-    page_title="HK Watch Prices",
+    page_title="Watch Prices",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
@@ -37,42 +40,63 @@ st.markdown(
       /* Tight metric cards */
       [data-testid="stMetricValue"] { font-size: 1.1rem; }
       [data-testid="stMetricLabel"] { font-size: 0.75rem; }
+      /* Market toggle: give it visual prominence at the top */
+      div[role="radiogroup"] label { font-weight: 600; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("HK Watch Prices")
-
-if not DB_PATH.exists():
-    st.error(f"Database not found at {DB_PATH}. Run `python src/refresh.py` first.")
+# ----- Market selector (top of page, always visible) -----
+MARKETS_AVAILABLE = [m for m in ("hk", "eu") if db_path(m).exists()]
+if not MARKETS_AVAILABLE:
+    st.error("No databases found. Run `python src/refresh.py` first.")
     st.stop()
 
+# Persist across reruns / sort changes / filter changes
+if "market" not in st.session_state:
+    st.session_state.market = MARKETS_AVAILABLE[0]
+
+cols_title = st.columns([2, 3])
+cols_title[0].title("Watch Prices")
+market_label = {"hk": "🇭🇰 HK", "eu": "🇪🇺 EU"}
+market = cols_title[1].radio(
+    "Market",
+    MARKETS_AVAILABLE,
+    format_func=lambda m: market_label.get(m, m.upper()),
+    horizontal=True,
+    key="market",
+    label_visibility="collapsed",
+)
+
+DB_PATH = db_path(market)
 conn = sqlite3.connect(DB_PATH)
 
 
 @st.cache_data(ttl=60)
-def load_distinct(col: str) -> list[str]:
-    rows = conn.execute(
-        f"SELECT DISTINCT {col} FROM listings WHERE {col} IS NOT NULL ORDER BY {col}"
-    ).fetchall()
+def load_distinct(col: str, market: str) -> list[str]:
+    with sqlite3.connect(db_path(market)) as c:
+        rows = c.execute(
+            f"SELECT DISTINCT {col} FROM listings WHERE {col} IS NOT NULL ORDER BY {col}"
+        ).fetchall()
     return [r[0] for r in rows]
 
 
 @st.cache_data(ttl=60)
-def overall_stats():
-    total = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
-    refs = conn.execute("SELECT COUNT(DISTINCT reference) FROM listings").fetchone()[0]
-    min_d, max_d = conn.execute(
-        "SELECT MIN(posted_at), MAX(posted_at) FROM listings"
-    ).fetchone()
+def overall_stats(market: str):
+    with sqlite3.connect(db_path(market)) as c:
+        total = c.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+        refs = c.execute("SELECT COUNT(DISTINCT reference) FROM listings").fetchone()[0]
+        min_d, max_d = c.execute(
+            "SELECT MIN(posted_at), MAX(posted_at) FROM listings"
+        ).fetchone()
     return total, refs, min_d, max_d
 
 
-total, n_refs, min_d, max_d = overall_stats()
+total, n_refs, min_d, max_d = overall_stats(market)
 st.caption(
-    f"{total:,} listings · {n_refs:,} refs · "
-    f"{min_d[:10]} → {max_d[:10]}"
+    f"{market_label.get(market, market.upper())} · {total:,} listings · "
+    f"{n_refs:,} refs · {min_d[:10]} → {max_d[:10]}"
 )
 
 # ----- TOP FILTER BAR (always visible) -----
@@ -94,7 +118,7 @@ with top2:
 # but don't dominate the screen.
 with st.expander("More filters", expanded=False):
     f1, f2 = st.columns(2)
-    brands = load_distinct("brand")
+    brands = load_distinct("brand", market)
     brand = f1.selectbox("Brand", [""] + brands)
     condition = f2.radio("Condition", ["any", "new", "used"], horizontal=True)
 

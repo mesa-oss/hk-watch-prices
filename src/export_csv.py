@@ -13,9 +13,9 @@ import csv
 from pathlib import Path
 
 from db import connect
+from paths import db_path, MARKETS
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "watches.db"
-DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "listings.csv"
+DEFAULT_OUT_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
 COLUMNS = [
@@ -37,7 +37,10 @@ def _format_year_label(year, month):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--market", choices=MARKETS, default="hk",
+                    help="Which market to export (default: hk)")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="Output CSV path (default: data/listings_<market>.csv)")
     ap.add_argument("--brand", help="Filter by brand (partial match)")
     ap.add_argument("--ref", help="Filter by reference (partial match)")
     ap.add_argument("--year", type=int)
@@ -45,7 +48,13 @@ def main():
     ap.add_argument("--since", help="YYYY-MM-DD")
     args = ap.parse_args()
 
-    conn = connect(DB_PATH)
+    if args.out is None:
+        # HK stays at data/listings.csv (backward compat with existing xlsx flow);
+        # EU writes to data/listings_eu.csv.
+        args.out = (DEFAULT_OUT_DIR / "listings.csv") if args.market == "hk" \
+                   else (DEFAULT_OUT_DIR / f"listings_{args.market}.csv")
+
+    conn = connect(db_path(args.market))
 
     where = []
     params: list = []

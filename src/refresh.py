@@ -1,10 +1,15 @@
 """Load WhatsApp export(s) into the SQLite database.
 
+Two markets are supported: HK (default, existing behavior) and EU (Reuven
+group). Each has its own DB file and its own exports directory.
+
 Usage:
-    python src/refresh.py                # parse all exports in ./exports/
-    python src/refresh.py path/to/file   # parse one specific file
-    python src/refresh.py --force        # reparse exports already loaded
-    python src/refresh.py --llm          # run LLM fallback on lines that regex missed
+    python src/refresh.py                        # HK: parse all exports/*.txt
+    python src/refresh.py --market eu            # EU: parse all exports/eu/*.txt
+    python src/refresh.py path/to/file           # parse one specific file (into HK)
+    python src/refresh.py --market eu path/…     # parse one file into EU db
+    python src/refresh.py --force                # reparse exports already loaded
+    python src/refresh.py --llm                  # run LLM fallback on unparsed
 """
 
 from __future__ import annotations
@@ -18,10 +23,7 @@ from db import (
     connect, insert_listings, mark_export_loaded, is_export_loaded,
     dedup_repeated_listings, vacuum, stats,
 )
-
-ROOT = Path(__file__).resolve().parent.parent
-EXPORTS_DIR = ROOT / "exports"
-DB_PATH = ROOT / "data" / "watches.db"
+from paths import db_path, exports_dir, MARKETS
 
 
 def load_export(conn, path: Path, *, force: bool, use_llm: bool) -> int:
@@ -51,22 +53,28 @@ def load_export(conn, path: Path, *, force: bool, use_llm: bool) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="*", type=Path, help="Specific export file(s) to load")
+    ap.add_argument("--market", choices=MARKETS, default="hk",
+                    help="Which market DB to load into (default: hk)")
     ap.add_argument("--force", action="store_true", help="Reload exports already marked as loaded")
     ap.add_argument("--llm", action="store_true", help="Use Claude API to recover unparsed lines")
     args = ap.parse_args()
 
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = connect(DB_PATH)
+    db_file = db_path(args.market)
+    exports = exports_dir(args.market)
+
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    conn = connect(db_file)
 
     if args.paths:
         files = args.paths
     else:
-        files = sorted(EXPORTS_DIR.glob("*.txt"))
+        files = sorted(exports.glob("*.txt"))
         if not files:
-            print(f"No .txt files found in {EXPORTS_DIR}")
+            print(f"No .txt files found in {exports}")
             sys.exit(1)
 
-    print(f"Database: {DB_PATH}")
+    print(f"Market:   {args.market.upper()}")
+    print(f"Database: {db_file}")
     print(f"Loading {len(files)} file(s)...")
     total = 0
     for f in files:

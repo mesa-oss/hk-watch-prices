@@ -17,8 +17,7 @@ import sys
 from pathlib import Path
 
 from db import connect, stats
-
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "watches.db"
+from paths import db_path, MARKETS
 
 
 def fmt_price(hkd: int | None, usdt: int | None) -> str:
@@ -32,6 +31,8 @@ def fmt_price(hkd: int | None, usdt: int | None) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="Query watch prices")
+    ap.add_argument("--market", choices=MARKETS, default="hk",
+                    help="Which market DB to query (default: hk)")
     ap.add_argument("--ref", help="Reference number (partial match, case insensitive)")
     ap.add_argument("--brand", help="Brand name (partial match)")
     ap.add_argument("--color", help="Dial color (partial match)")
@@ -51,11 +52,12 @@ def main():
     ap.add_argument("--top", type=int, help="Show the N most-listed references")
     args = ap.parse_args()
 
-    if not DB_PATH.exists():
-        print(f"No database at {DB_PATH}. Run `python src/refresh.py` first.")
+    db_file = db_path(args.market)
+    if not db_file.exists():
+        print(f"No database at {db_file}. Run `python src/refresh.py --market {args.market}` first.")
         sys.exit(1)
 
-    conn = connect(DB_PATH)
+    conn = connect(db_file)
 
     if args.stats:
         s = stats(conn)
