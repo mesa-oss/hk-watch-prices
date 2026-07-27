@@ -250,6 +250,8 @@ class Listing:
     dial_details: str | None = None  # diamond / roman / pavé / etc.
     metal: str | None = None    # decoded from Rolex 6th digit (Steel, RG, ...)
     nickname: str | None = None  # YML → Pikachu, PN → Paul Newman
+    price_eur: int | None = None    # EUR price (Reuven EU market)
+    seller_phone: str | None = None  # phone number if seller is unnamed
 
 
 def format_month(year: int | None, month: int | None) -> str:
@@ -311,8 +313,53 @@ def parse_price(text: str) -> tuple[int | None, int | None]:
     return hkd, usdt
 
 
-def extract_price(line: str) -> tuple[int | None, int | None, str]:
-    """Extract price and return (hkd, usdt, matched_chunk)."""
+def _extract_eur(line: str) -> int | None:
+    """Extract a EUR price from the line, respecting European number format.
+
+    In EU pricing conventions the '.' and "'" and non-breaking space are
+    THOUSANDS separators, not decimals:
+        12.500€   → 12500
+        12'500€   → 12500  (Swiss style)
+        1.950€    → 1950
+        12,500€   → 12500  (some sellers use comma-thousands too)
+
+    This is opposite to the HKD `1.82m` convention where '.' is decimal
+    (1.82 million). Only EUR-marked amounts run through this parser.
+    """
+    # Accept ‘ (curly) as apostrophe, plus straight ' and dot / comma / thin
+    # space. Strip * bold markers so `*12.500€*` matches.
+    pats = [
+        # amount then €
+        re.compile(r"(\d{1,3}(?:[\.,'’ \s]\d{3})+|\d{4,7})\s*€"),
+        # € then amount
+        re.compile(r"€\s*(\d{1,3}(?:[\.,'’ \s]\d{3})+|\d{4,7})"),
+        # EUR word form
+        re.compile(r"\bEUR\s*:?\s*(\d[\d\.,'’ \s]*)", re.I),
+        re.compile(r"(\d[\d\.,'’ \s]*)\s*EUR\b", re.I),
+    ]
+    for pat in pats:
+        for m in pat.finditer(line):
+            amt_str = m.group(1)
+            # Strip every thousands separator to leave pure digits
+            digits = re.sub(r"[^\d]", "", amt_str)
+            if not digits or len(digits) < 3:
+                continue
+            amt = int(digits)
+            # Sanity: EUR watch prices realistically 1k–20M
+            if 500 <= amt <= 20_000_000:
+                return amt
+    return None
+
+
+def extract_price(line: str) -> tuple[int | None, int | None, int | None, str]:
+    """Extract price and return (hkd, usdt, eur, matched_chunk).
+
+    HKD and USDT use the '1.82m'-as-decimal convention (Asian dealer style).
+    EUR uses European thousands-separator convention — handled in
+    _extract_eur() to avoid conflating '12.500€' (12,500 EUR) with '12.500m'
+    (12.5 million).
+    """
+    eur = _extract_eur(line)
     # Greedy: look for explicit HKD/USDT/$ markers first
     pats = [
         re.compile(r"(?:HKD|hkd)\s*:?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
@@ -321,7 +368,9 @@ def extract_price(line: str) -> tuple[int | None, int | None, str]:
         re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?\s*(?:USDT|usdt)", re.I),
         re.compile(r"\$\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
         re.compile(r"💰\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
-        re.compile(r"price[\s:]+(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
+        # Note: a generic 'price:' pattern was removed — it swallowed the
+        # word 'price' in unrelated contexts (e.g. 'Max price: 12500€') and
+        # mis-tagged EUR amounts as HKD.
     ]
     hkd = None
     usdt = None
@@ -374,7 +423,7 @@ def extract_price(line: str) -> tuple[int | None, int | None, str]:
 
     # Fallback 2: a 5-7 digit integer near the end of the line (likely an
     # un-suffixed HKD price like "168000 HKD" or "150,000")
-    if hkd is None and usdt is None:
+    if hkd is None and usdt is None and eur is None:
         # Search ONLY in the second half of the line — refs are at the start
         half = max(len(line) // 2, 1)
         for m in re.finditer(r"\b(\d{5,7})\b", line[half:]):
@@ -382,7 +431,7 @@ def extract_price(line: str) -> tuple[int | None, int | None, str]:
             if 5000 <= amt <= 50_000_000:
                 hkd = amt
                 break
-    return hkd, usdt, line
+    return hkd, usdt, eur, line
 
 
 def extract_condition(line: str) -> tuple[str | None, bool | None]:
@@ -681,6 +730,10 @@ def extract_reference(line: str) -> str | None:
             # Reject leading-zero numerics
             if re.fullmatch(r"\d{5,7}", ref) and ref.startswith("0"):
                 continue
+            # Reject digit+currency-code combos ('39750EUR', '868KHKD') —
+            # these are prices with a glued-on currency word, not refs.
+            if re.fullmatch(r"\d+(?:EUR|USD|USDT|HKD|K|M|MIL)", ref):
+                continue
             # Prefer the leftmost ref overall; ties broken by pattern priority
             # (earlier patterns are more specific).
             cand = (pos, pat_idx, ref)
@@ -706,9 +759,36 @@ def is_listing_line(line: str) -> bool:
     if not re.search(r"\d{3,7}", line):
         return False
     # Must have something currency-like or a reference shape
-    has_currency = bool(re.search(r"(?:hkd|usdt|usd)\b|\$|💰|\bk\b|\bm\b|mil", line, re.I))
+    has_currency = bool(
+        re.search(r"(?:hkd|usdt|usd|eur)\b|\$|€|💰|\bk\b|\bm\b|mil", line, re.I)
+    )
     has_ref = bool(extract_reference(line))
     return has_currency or has_ref
+
+
+# Seller field that is *only* a phone number (WhatsApp displays the phone
+# when the sender isn't in your contacts). Detect these so we can split
+# 'seller' into a display name vs a phone number cleanly.
+# Handles Unicode LRE/PDF marks that WhatsApp wraps around phone strings.
+_PHONE_ONLY_RE = re.compile(
+    r"^[\+‪‫⁦-⁩\s]*\+?\d[\d\s\-\(\)]{6,}\s*[‬⁩]?$"
+)
+_INVISIBLES_RE = re.compile(r"[‪-‮⁦-⁩]")
+
+
+def extract_seller_phone(seller: str | None) -> str | None:
+    """If the seller string is purely a phone number, return the normalized
+    phone (invisible bidi marks stripped, whitespace collapsed). Return
+    None when the seller is a name."""
+    if not seller:
+        return None
+    stripped = _INVISIBLES_RE.sub("", seller).strip()
+    if not stripped:
+        return None
+    if _PHONE_ONLY_RE.match(stripped):
+        # Collapse internal whitespace
+        return re.sub(r"\s+", " ", stripped).strip()
+    return None
 
 
 def parse_line(line: str, posted_at: str, seller: str, message_context: str, source_file: str) -> Listing | None:
@@ -719,8 +799,8 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
     ref = extract_reference(line)
     if not ref:
         return None
-    hkd, usdt, _ = extract_price(line)
-    if hkd is None and usdt is None:
+    hkd, usdt, eur, _ = extract_price(line)
+    if hkd is None and usdt is None and eur is None:
         return None
     condition, full_set = extract_condition(line)
     # Condition fallback from context (e.g., "VC New Stock" header above)
@@ -744,6 +824,7 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
         else:
             details = dial_feature
     nickname = extract_nickname(line)
+    seller_phone = extract_seller_phone(seller)
 
     return Listing(
         posted_at=posted_at,
@@ -765,6 +846,8 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
         dial_details=details,
         metal=metal,
         nickname=nickname,
+        price_eur=eur,
+        seller_phone=seller_phone,
     )
 
 
@@ -841,17 +924,17 @@ def parse_export(path: Path) -> ParseResult:
 
             # Maybe this is a ref-only line (no price) — remember for pairing
             ref = extract_reference(line)
-            hkd, usdt, _ = extract_price(line)
+            hkd, usdt, eur, _ = extract_price(line)
             has_price_marker = bool(
-                re.search(r"(?:hkd|usdt|usd|💰)", line, re.I) or "$" in line
+                re.search(r"(?:hkd|usdt|usd|eur|💰|€)", line, re.I) or "$" in line
             )
-            if ref and not (hkd or usdt) and not has_price_marker \
+            if ref and not (hkd or usdt or eur) and not has_price_marker \
                     and not any(kw in line.lower() for kw in WTB_KEYWORDS):
                 pending_ref_line = line
                 continue
 
             # Maybe this is a price-only line and we have a pending ref above
-            if pending_ref_line and (hkd or usdt or has_price_marker) and not ref:
+            if pending_ref_line and (hkd or usdt or eur or has_price_marker) and not ref:
                 combined = f"{pending_ref_line} {line}"
                 listing = parse_line(combined, posted_at, seller or "", body, source_file)
                 if listing:

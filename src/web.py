@@ -182,15 +182,18 @@ if seller:
 
 order_clause = {
     "Newest": "posted_at DESC",
-    "Price ↑": "COALESCE(price_hkd, price_usdt*8) ASC NULLS LAST",
-    "Price ↓": "COALESCE(price_hkd, price_usdt*8) DESC NULLS LAST",
+    # For sorting, normalize everything to HKD-equivalent
+    # (USDT ≈ 7.8 HKD, EUR ≈ 8.4 HKD as rough current rates)
+    "Price ↑": "COALESCE(price_hkd, price_usdt*7.8, price_eur*8.4) ASC NULLS LAST",
+    "Price ↓": "COALESCE(price_hkd, price_usdt*7.8, price_eur*8.4) DESC NULLS LAST",
     "Year ↓": "year_made DESC NULLS LAST, posted_at DESC",
 }[sort_by]
 
 sql = f"""
-SELECT posted_at, seller, brand, reference, dial_color, dial_details,
-       metal, nickname, year_made, month_made, condition, full_set,
-       price_hkd, price_usdt, clean_line, raw_line
+SELECT posted_at, seller, seller_phone, brand, reference,
+       dial_color, dial_details, metal, nickname,
+       year_made, month_made, condition, full_set,
+       price_hkd, price_usdt, price_eur, clean_line, raw_line
 FROM listings
 WHERE {' AND '.join(where)}
 ORDER BY {order_clause}
@@ -210,12 +213,17 @@ def fmt_month(m) -> str:
     return f"N{int(m)}" if pd.notna(m) else ""
 
 
-def fmt_price(hkd, usdt) -> str:
-    """One price column. HKD is the default. ₮ suffix only when seller listed
-    crypto only (no HKD)."""
-    val = hkd if pd.notna(hkd) else None
-    if val is not None:
-        v = float(val)
+def fmt_price(hkd, usdt, eur=None) -> str:
+    """One price column. Prefers EUR > HKD > USDT. Currency suffix indicates
+    which one is being shown (EUR = €, USDT = ₮, HKD default = no suffix).
+    """
+    if pd.notna(eur):
+        v = float(eur)
+        if v >= 1_000_000:
+            return f"{v/1_000_000:.2f}M €"
+        return f"{int(v/1_000):,}k €"
+    if pd.notna(hkd):
+        v = float(hkd)
         if v >= 1_000_000:
             return f"{v/1_000_000:.2f}M"
         return f"{int(v/1_000):,}k"
@@ -256,7 +264,10 @@ if len(df):
     # dial, tropical patina, bracelet vs leather, edition numbers, stickers,
     # diamond placement, etc. — even if it means some emoji clutter.
     df["Description"] = df["raw_line"].fillna("")
-    df["Price"] = df.apply(lambda r: fmt_price(r["price_hkd"], r["price_usdt"]), axis=1)
+    df["Price"] = df.apply(
+        lambda r: fmt_price(r["price_hkd"], r["price_usdt"], r.get("price_eur")),
+        axis=1,
+    )
 
     # Compact metrics in a single row
     hkd = df["price_hkd"].dropna()
@@ -290,11 +301,15 @@ if len(df):
         },
     )
 
-    with st.expander("Show full row (brand, seller, condition, raw line)"):
+    with st.expander("Show full row (brand, seller, phone, date, raw line)"):
+        # Split posted_at into Date + Time for the expander view
+        df["Date"] = df["posted_at"].str.slice(0, 10)
+        df["Time"] = df["posted_at"].str.slice(11, 16)
         full = df[[
-            "reference", "nickname", "brand", "Year", "N", "metal",
-            "dial_color", "dial_details", "condition", "full_set",
-            "price_hkd", "price_usdt", "seller", "posted_at", "raw_line",
+            "Date", "Time", "reference", "nickname", "brand", "Year", "N",
+            "metal", "dial_color", "dial_details", "condition", "full_set",
+            "price_hkd", "price_usdt", "price_eur",
+            "seller", "seller_phone", "raw_line",
         ]]
         st.dataframe(full, width="stretch", hide_index=True)
         st.download_button(

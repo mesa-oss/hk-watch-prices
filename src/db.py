@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS listings (
     dial_details TEXT,
     metal TEXT,
     nickname TEXT,
+    price_eur INTEGER,
+    seller_phone TEXT,
     UNIQUE(posted_at, seller, raw_line)
 );
 
@@ -62,11 +64,13 @@ def insert_listings(conn: sqlite3.Connection, listings: Iterable[Listing]) -> in
     INSERT OR IGNORE INTO listings (
         posted_at, seller, brand, reference, dial_color, year_made, month_made,
         condition, price_hkd, price_usdt, full_set, raw_line, raw_message,
-        source_file, confidence, clean_line, dial_details, metal, nickname
+        source_file, confidence, clean_line, dial_details, metal, nickname,
+        price_eur, seller_phone
     ) VALUES (
         :posted_at, :seller, :brand, :reference, :dial_color, :year_made, :month_made,
         :condition, :price_hkd, :price_usdt, :full_set, :raw_line, :raw_message,
-        :source_file, :confidence, :clean_line, :dial_details, :metal, :nickname
+        :source_file, :confidence, :clean_line, :dial_details, :metal, :nickname,
+        :price_eur, :seller_phone
     )
     """
     rows = [asdict(l) for l in listings]
@@ -131,7 +135,8 @@ def dedup_repeated_listings(conn: sqlite3.Connection) -> tuple[int, int]:
                 COALESCE(condition, ''),
                 COALESCE(full_set, -1),
                 COALESCE(price_hkd, 0),
-                COALESCE(price_usdt, 0)
+                COALESCE(price_usdt, 0),
+                COALESCE(price_eur, 0)
         )
         """
     )
