@@ -640,12 +640,311 @@ def render_deal_finder(buy_market: str, ref_market: str) -> None:
     )
 
 
-# ----- Top-level tabs: one per market + Deal Finder -----
-tab_titles = [MARKET_LABEL[m] for m in MARKETS_AVAILABLE] + ["🔀 Deal Finder"]
+def render_top_deals() -> None:
+    """Streamlined view for the user's main workflow: buy in Europe
+    (Reuven + WDG combined), sell in HK. Only positive-delta listings are
+    shown, sorted best-first. This is the tab she'll live in day-to-day.
+    """
+    # Which European sources are available? 'eu' = Reuven, 'wdg' = WDG.
+    eu_sources = [m for m in ("eu", "wdg") if m in MARKETS_AVAILABLE]
+    if "hk" not in MARKETS_AVAILABLE or not eu_sources:
+        st.warning(
+            "Top Deals needs both HK and at least one EU database loaded. "
+            f"Currently have: {', '.join(MARKETS_AVAILABLE)}"
+        )
+        return
+
+    st.markdown(
+        "**Best EU → HK deals right now.** Only listings where the EU buy "
+        "price is at or below the cheapest same-spec HK listing. Sorted by "
+        "delta % — biggest opportunity at the top."
+    )
+
+    # --- Filters (same shape as Deal Finder, no market pickers) ---
+    top1, top2, top3 = st.columns([2, 1, 1])
+    with top1:
+        ref = st.text_input(
+            "Reference", "", placeholder="e.g. 5167, 26240OR, RM035",
+            label_visibility="collapsed", key="td_ref",
+        )
+    with top2:
+        min_delta_pct = st.selectbox(
+            "Min delta",
+            ["Any positive", "≥ 5%", "≥ 10%", "≥ 20%"],
+            label_visibility="collapsed", key="td_mindelta",
+        )
+    with top3:
+        source_pick = st.selectbox(
+            "EU source",
+            ["Both"] + [MARKET_LABEL[m] for m in eu_sources],
+            label_visibility="collapsed", key="td_source",
+        )
+
+    with st.expander("More filters", expanded=False):
+        f1, f2 = st.columns(2)
+        # Union of brands across all EU sources so the picker is complete
+        brand_set: set[str] = set()
+        for m in eu_sources:
+            brand_set.update(load_distinct("brand", m))
+        brand = f1.selectbox("Brand", [""] + sorted(brand_set), key="td_brand")
+        condition = f2.radio("Condition", ["any", "new", "used"],
+                             horizontal=True, key="td_cond")
+
+        f3, f4 = st.columns(2)
+        color = f3.text_input("Color", "", placeholder="blue, salmon",
+                              key="td_color")
+        details = f4.text_input("Details", "", placeholder="diamond, roman",
+                                key="td_details")
+
+        f5, f6 = st.columns(2)
+        full_set = f5.radio("Full set", ["any", "yes", "no"],
+                            horizontal=True, key="td_fs")
+        seller = f6.text_input("Seller", "", key="td_seller")
+
+        year_min, year_max = st.slider("Year made", 1990, 2030, (2010, 2026),
+                                       key="td_year")
+
+    # --- Which sources to load ---
+    load_sources = eu_sources
+    if source_pick != "Both":
+        # User picked a single source
+        load_sources = [m for m in eu_sources if MARKET_LABEL[m] == source_pick]
+
+    # --- Build the shared WHERE clause (applied to each EU source) ---
+    where = ["1=1"]
+    params: list = []
+    if ref:
+        where.append(
+            "(reference LIKE ? COLLATE NOCASE "
+            "OR nickname LIKE ? COLLATE NOCASE "
+            "OR raw_line LIKE ? COLLATE NOCASE)"
+        )
+        needle = f"%{ref}%"
+        params.extend([needle, needle, needle])
+    if brand:
+        where.append("brand = ?")
+        params.append(brand)
+    if color:
+        where.append(
+            "(dial_color LIKE ? COLLATE NOCASE "
+            "OR dial_details LIKE ? COLLATE NOCASE "
+            "OR raw_line LIKE ? COLLATE NOCASE)"
+        )
+        needle = f"%{color}%"
+        params.extend([needle, needle, needle])
+    if details:
+        where.append(
+            "(dial_details LIKE ? COLLATE NOCASE OR raw_line LIKE ? COLLATE NOCASE)"
+        )
+        needle = f"%{details}%"
+        params.extend([needle, needle])
+    where.append("(year_made IS NULL OR year_made BETWEEN ? AND ?)")
+    params.extend([year_min, year_max])
+    if condition != "any":
+        where.append("condition = ?")
+        params.append(condition)
+    if full_set != "any":
+        where.append("full_set = ?")
+        params.append(1 if full_set == "yes" else 0)
+    if seller:
+        where.append("seller LIKE ? COLLATE NOCASE")
+        params.append(f"%{seller}%")
+
+    # --- Load buy-side from every selected EU source, tag with source ---
+    buy_parts = []
+    for m in load_sources:
+        sql = f"""
+        SELECT posted_at, seller, seller_phone, brand, reference,
+               dial_color, dial_details, metal, nickname,
+               year_made, month_made, condition, full_set,
+               price_hkd, price_usdt, price_eur, raw_line
+        FROM listings
+        WHERE {' AND '.join(where)}
+        ORDER BY posted_at DESC
+        LIMIT 2000
+        """
+        with sqlite3.connect(db_path(m)) as conn:
+            df_m = pd.read_sql_query(sql, conn, params=params)
+        df_m["source"] = m
+        buy_parts.append(df_m)
+    buy_df = pd.concat(buy_parts, ignore_index=True) if buy_parts else pd.DataFrame()
+
+    if not len(buy_df):
+        st.info("No EU listings match those filters.")
+        return
+
+    buy_df["buy_usd"] = buy_df.apply(
+        lambda r: row_to_usd(r["price_hkd"], r["price_usdt"], r["price_eur"]),
+        axis=1,
+    )
+    buy_df = buy_df[
+        buy_df["buy_usd"].notna()
+        & (buy_df["buy_usd"] >= 1_000)
+        & (buy_df["buy_usd"] <= 30_000_000)
+    ].copy()
+
+    if not len(buy_df):
+        st.info("EU listings found but none had a parseable price.")
+        return
+
+    # --- Load HK reference side (only refs we actually need) ---
+    refs_needed = tuple(buy_df["reference"].dropna().unique())
+    placeholders = ",".join("?" for _ in refs_needed)
+    with sqlite3.connect(db_path("hk")) as conn:
+        hk_df = pd.read_sql_query(
+            f"""
+            SELECT reference, year_made, month_made, condition, dial_details,
+                   metal, full_set, price_hkd, price_usdt, price_eur,
+                   raw_line, posted_at, seller, seller_phone
+            FROM listings
+            WHERE reference IN ({placeholders}) COLLATE NOCASE
+            """,
+            conn, params=list(refs_needed),
+        )
+    hk_df["hk_usd"] = hk_df.apply(
+        lambda r: row_to_usd(r["price_hkd"], r["price_usdt"], r["price_eur"]),
+        axis=1,
+    )
+    hk_df = hk_df[
+        hk_df["hk_usd"].notna()
+        & (hk_df["hk_usd"] >= 1_000)
+        & (hk_df["hk_usd"] <= 30_000_000)
+    ].copy()
+    if not len(hk_df):
+        st.info("None of these EU refs are present in HK yet — no comparison possible.")
+        return
+
+    hk_df["_sig"] = hk_df.apply(_spec_sig, axis=1)
+    agg = (
+        hk_df.sort_values("hk_usd").groupby("_sig")
+        .agg(hk_min_usd=("hk_usd", "min"),
+             hk_n=("hk_usd", "size"),
+             hk_raw=("raw_line", "first"),
+             hk_seller=("seller", "first"),
+             hk_phone=("seller_phone", "first"),
+             hk_posted=("posted_at", "first"))
+        .reset_index()
+    )
+
+    buy_df["_sig"] = buy_df.apply(_spec_sig, axis=1)
+    merged = buy_df.merge(agg, on="_sig", how="inner")
+
+    # Compute delta and KEEP ONLY POSITIVE deltas (user's rule: EU ≤ HK)
+    merged["delta_usd"] = merged["hk_min_usd"] - merged["buy_usd"]
+    merged["delta_pct"] = merged["delta_usd"] / merged["buy_usd"] * 100
+    merged = merged[merged["delta_pct"] >= 0].copy()
+
+    # Sanity cap: deltas over ~60% are almost always parser errors on one
+    # side. Real cross-market arbitrage in the watch market is 3-25%,
+    # occasionally to 40% for a genuinely underpriced listing. Anything
+    # higher is a mis-captured price (usually the EU side missing a digit).
+    merged = merged[merged["delta_pct"] <= 60.0].copy()
+
+    # Apply min-delta filter
+    threshold = {"Any positive": 0.0, "≥ 5%": 5.0, "≥ 10%": 10.0, "≥ 20%": 20.0}[min_delta_pct]
+    merged = merged[merged["delta_pct"] >= threshold]
+
+    if not len(merged):
+        st.info(
+            f"No EU listings currently priced at or below HK's cheapest same-spec "
+            f"(with min delta {min_delta_pct}). Loosen filters or wait for new data."
+        )
+        return
+
+    merged = merged.sort_values("delta_pct", ascending=False)
+
+    # --- Display ---
+    def _fmt_ref(row):
+        r = row["reference"]
+        n = row["nickname"]
+        return f"{r} ({n})" if isinstance(n, str) and n else r
+
+    merged["Ref"] = merged.apply(_fmt_ref, axis=1)
+    merged["Year"] = merged["year_made"].apply(fmt_year)
+    merged["N"] = merged["month_made"].apply(fmt_month)
+    merged["Cond"] = merged["condition"].fillna("").str.slice(0, 4)
+    merged["Metal"] = merged["metal"].fillna("")
+    merged["Dial"] = merged.apply(
+        lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1,
+    )
+    merged["Src"] = merged["source"].map({m: MARKET_SHORT[m] for m in eu_sources})
+    merged["EU $"] = merged["buy_usd"].apply(fmt_usd)
+    merged["HK min $"] = merged["hk_min_usd"].apply(fmt_usd)
+    merged["HK n"] = merged["hk_n"]
+    merged["Delta $"] = merged["delta_usd"].apply(fmt_usd)
+    merged["Delta %"] = merged["delta_pct"].apply(lambda x: f"+{x:.1f}%")
+    merged["EU date"] = merged["posted_at"].str.slice(0, 10)
+    merged["EU seller"] = merged["seller"].fillna("")
+    merged["EU phone"] = merged["seller_phone"].fillna("")
+    merged["HK date"] = merged["hk_posted"].str.slice(0, 10)
+    merged["HK seller"] = merged["hk_seller"].fillna("")
+    merged["HK phone"] = merged["hk_phone"].fillna("")
+    merged["EU raw"] = merged["raw_line"].fillna("")
+    merged["HK raw"] = merged["hk_raw"].fillna("")
+
+    # Summary metrics
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🔥 Deals", f"{len(merged):,}")
+    m2.metric("Best %", f"+{merged['delta_pct'].max():.1f}%")
+    m3.metric("Best $", fmt_usd(merged['delta_usd'].max()))
+    m4.metric("Total spread $", fmt_usd(merged['delta_usd'].sum()))
+
+    display = merged[[
+        "Src", "Ref", "Year", "N", "Cond", "Metal", "Dial",
+        "EU $", "HK min $", "HK n", "Delta $", "Delta %",
+        "EU date", "EU seller", "EU phone",
+        "HK date", "HK seller", "HK phone",
+        "EU raw", "HK raw",
+    ]]
+
+    st.dataframe(
+        display,
+        width="stretch",
+        hide_index=True,
+        height=min(700, 38 * (len(display) + 1) + 3),
+        column_config={
+            "Src": st.column_config.TextColumn(width="small",
+                help="Which EU group the listing came from"),
+            "Ref": st.column_config.TextColumn(width="small"),
+            "Year": st.column_config.TextColumn(width="small"),
+            "N": st.column_config.TextColumn(width="small"),
+            "Cond": st.column_config.TextColumn(width="small"),
+            "Metal": st.column_config.TextColumn(width="small"),
+            "Dial": st.column_config.TextColumn(width="medium"),
+            "EU $": st.column_config.TextColumn(width="small"),
+            "HK min $": st.column_config.TextColumn(width="small"),
+            "HK n": st.column_config.NumberColumn(width="small"),
+            "Delta $": st.column_config.TextColumn(width="small"),
+            "Delta %": st.column_config.TextColumn(width="small"),
+            "EU date": st.column_config.TextColumn(width="small"),
+            "EU seller": st.column_config.TextColumn(width="medium"),
+            "EU phone": st.column_config.TextColumn(width="medium"),
+            "HK date": st.column_config.TextColumn(width="small"),
+            "HK seller": st.column_config.TextColumn(width="medium"),
+            "HK phone": st.column_config.TextColumn(width="medium"),
+            "EU raw": st.column_config.TextColumn(width="large"),
+            "HK raw": st.column_config.TextColumn(width="large"),
+        },
+    )
+
+    st.download_button(
+        "Download deals CSV",
+        display.to_csv(index=False).encode("utf-8"),
+        "top_deals_eu_to_hk.csv",
+        "text/csv",
+        key="td_dl",
+    )
+
+
+# ----- Top-level tabs: 🔥 Top Deals FIRST, then per-market, then Deal Finder -----
+tab_titles = ["🔥 Top Deals"] + [MARKET_LABEL[m] for m in MARKETS_AVAILABLE] + ["🔀 Deal Finder"]
 tabs = st.tabs(tab_titles)
 
+with tabs[0]:
+    render_top_deals()
+
 for i, m in enumerate(MARKETS_AVAILABLE):
-    with tabs[i]:
+    with tabs[i + 1]:
         render_market_view(m)
 
 # ==========================================================================
