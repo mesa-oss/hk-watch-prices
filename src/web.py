@@ -1,8 +1,11 @@
-"""Streamlit web UI for browsing the watch price database.
+"""Streamlit web UI for the watch price databases.
 
-Mobile-first: filters and sort live at the top of the page (not in a hidden
-sidebar) with big touch targets. The table is a compact 5-column view; full
-row details are available via an expander.
+Two tabs:
+  📋 Prices          — browse a single market's listings (filter + sort)
+  🔀 Compare markets — same watch across HK / EU / Europe / etc. in USD
+
+Mobile-first: filters and sort live at the top of each tab, big touch
+targets, no hidden sidebar.
 
 Run with:
     streamlit run src/web.py
@@ -32,211 +35,79 @@ st.markdown(
     """
     <style>
       div.block-container { padding-top: 1rem; padding-bottom: 1rem; }
-      /* Larger touch targets for selects / inputs */
       div[data-baseweb="select"] > div, .stTextInput input,
       .stSelectbox > div, .stRadio > div, button[kind="secondary"] {
         min-height: 42px;
       }
-      /* Tight metric cards */
       [data-testid="stMetricValue"] { font-size: 1.1rem; }
       [data-testid="stMetricLabel"] { font-size: 0.75rem; }
-      /* Market toggle: give it visual prominence at the top */
       div[role="radiogroup"] label { font-weight: 600; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# ----- Market selector (top of page, always visible) -----
-MARKETS_AVAILABLE = [m for m in ("hk", "eu") if db_path(m).exists()]
+# ----- Market discovery -----
+MARKETS_AVAILABLE = [m for m in ("hk", "eu", "europe") if db_path(m).exists()]
 if not MARKETS_AVAILABLE:
     st.error("No databases found. Run `python src/refresh.py` first.")
     st.stop()
 
-# Persist across reruns / sort changes / filter changes
-if "market" not in st.session_state:
-    st.session_state.market = MARKETS_AVAILABLE[0]
-
-cols_title = st.columns([2, 3])
-cols_title[0].title("Watch Prices")
-market_label = {"hk": "🇭🇰 HK", "eu": "🇪🇺 EU (Reuven)", "europe": "🇪🇺 Europe"}
-market = cols_title[1].radio(
-    "Market",
-    MARKETS_AVAILABLE,
-    format_func=lambda m: market_label.get(m, m.upper()),
-    horizontal=True,
-    key="market",
-    label_visibility="collapsed",
-)
-
-DB_PATH = db_path(market)
-conn = sqlite3.connect(DB_PATH)
+MARKET_LABEL = {"hk": "🇭🇰 HK", "eu": "🇪🇺 EU (Reuven)", "europe": "🇪🇺 Europe"}
+# Short code used in Compare-tab column headers ("HK n", "EU min $", ...)
+MARKET_SHORT = {"hk": "HK", "eu": "EU", "europe": "EUROPE"}
 
 
-@st.cache_data(ttl=60)
-def load_distinct(col: str, market: str) -> list[str]:
-    with sqlite3.connect(db_path(market)) as c:
-        rows = c.execute(
-            f"SELECT DISTINCT {col} FROM listings WHERE {col} IS NOT NULL ORDER BY {col}"
-        ).fetchall()
-    return [r[0] for r in rows]
+# ----- Currency conversion (fixed rates; approximate) -----
+# HKD → USD: ÷7.8       EUR → USD: ×1.08       USDT → USD: 1:1
+FX_TO_USD = {"hkd": 1 / 7.8, "eur": 1.08, "usdt": 1.0}
 
 
-@st.cache_data(ttl=60)
-def overall_stats(market: str):
-    with sqlite3.connect(db_path(market)) as c:
-        total = c.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
-        refs = c.execute("SELECT COUNT(DISTINCT reference) FROM listings").fetchone()[0]
-        min_d, max_d = c.execute(
-            "SELECT MIN(posted_at), MAX(posted_at) FROM listings"
-        ).fetchone()
-    return total, refs, min_d, max_d
+def row_to_usd(price_hkd, price_usdt, price_eur) -> float | None:
+    """Return the row's price converted to USD. Preference:
+    HKD > EUR > USDT (arbitrary, but keeps the same currency's history
+    consistent for comparison over time)."""
+    if pd.notna(price_hkd):
+        return float(price_hkd) * FX_TO_USD["hkd"]
+    if pd.notna(price_eur):
+        return float(price_eur) * FX_TO_USD["eur"]
+    if pd.notna(price_usdt):
+        return float(price_usdt) * FX_TO_USD["usdt"]
+    return None
 
 
-total, n_refs, min_d, max_d = overall_stats(market)
-st.caption(
-    f"{market_label.get(market, market.upper())} · {total:,} listings · "
-    f"{n_refs:,} refs · {min_d[:10]} → {max_d[:10]}"
-)
-
-# ----- TOP FILTER BAR (always visible) -----
-# Two main filters always on screen: reference search + sort. Big inputs.
-top1, top2 = st.columns([2, 1])
-with top1:
-    ref = st.text_input(
-        "Reference", "", placeholder="e.g. 5167, 26240OR, RM035",
-        label_visibility="collapsed",
-    )
-with top2:
-    sort_by = st.selectbox(
-        "Sort",
-        ["Newest", "Price ↑", "Price ↓", "Year ↓"],
-        label_visibility="collapsed",
-    )
-
-# Secondary filters in an always-open expander so they're 1 tap from view
-# but don't dominate the screen.
-with st.expander("More filters", expanded=False):
-    f1, f2 = st.columns(2)
-    brands = load_distinct("brand", market)
-    brand = f1.selectbox("Brand", [""] + brands)
-    condition = f2.radio("Condition", ["any", "new", "used"], horizontal=True)
-
-    f3, f4 = st.columns(2)
-    color = f3.text_input("Color", "", placeholder="blue, salmon, ice blue")
-    details = f4.text_input("Details", "", placeholder="diamond, roman, pavé")
-
-    f5, f6 = st.columns(2)
-    full_set = f5.radio("Full set", ["any", "yes", "no"], horizontal=True)
-    seller = f6.text_input("Seller", "")
-
-    year_min, year_max = st.slider("Year made", 1990, 2030, (2010, 2026))
-
-# ----- Build SQL -----
-where = ["1=1"]
-params: list = []
-if ref:
-    # Reference filter also matches nicknames (typing "Pikachu" surfaces
-    # YML rows; typing "Paul Newman" surfaces PN rows). Falls back to the
-    # raw line so partial matches like "126508" still work.
-    where.append(
-        "(reference LIKE ? COLLATE NOCASE "
-        "OR nickname LIKE ? COLLATE NOCASE "
-        "OR raw_line LIKE ? COLLATE NOCASE)"
-    )
-    needle = f"%{ref}%"
-    params.extend([needle, needle, needle])
-if brand:
-    where.append("brand = ?")
-    params.append(brand)
-if color:
-    # Broad search: color filter matches dial_color OR dial_details OR the
-    # original raw description. Typing 'grey' will surface any row
-    # mentioning grey anywhere, not just rows tagged dial_color='grey'.
-    where.append(
-        "(dial_color LIKE ? COLLATE NOCASE "
-        "OR dial_details LIKE ? COLLATE NOCASE "
-        "OR raw_line LIKE ? COLLATE NOCASE)"
-    )
-    needle = f"%{color}%"
-    params.extend([needle, needle, needle])
-if details:
-    # Same broadening so 'diamond' / 'roman' / 'panda' matches wherever the
-    # word appears in the original line.
-    where.append(
-        "(dial_details LIKE ? COLLATE NOCASE OR raw_line LIKE ? COLLATE NOCASE)"
-    )
-    needle = f"%{details}%"
-    params.extend([needle, needle])
-where.append("(year_made IS NULL OR year_made BETWEEN ? AND ?)")
-params.extend([year_min, year_max])
-if condition != "any":
-    where.append("condition = ?")
-    params.append(condition)
-if full_set != "any":
-    where.append("full_set = ?")
-    params.append(1 if full_set == "yes" else 0)
-if seller:
-    where.append("seller LIKE ? COLLATE NOCASE")
-    params.append(f"%{seller}%")
-
-order_clause = {
-    "Newest": "posted_at DESC",
-    # For sorting, normalize everything to HKD-equivalent
-    # (USDT ≈ 7.8 HKD, EUR ≈ 8.4 HKD as rough current rates)
-    "Price ↑": "COALESCE(price_hkd, price_usdt*7.8, price_eur*8.4) ASC NULLS LAST",
-    "Price ↓": "COALESCE(price_hkd, price_usdt*7.8, price_eur*8.4) DESC NULLS LAST",
-    "Year ↓": "year_made DESC NULLS LAST, posted_at DESC",
-}[sort_by]
-
-sql = f"""
-SELECT posted_at, seller, seller_phone, brand, reference,
-       dial_color, dial_details, metal, nickname,
-       year_made, month_made, condition, full_set,
-       price_hkd, price_usdt, price_eur, clean_line, raw_line
-FROM listings
-WHERE {' AND '.join(where)}
-ORDER BY {order_clause}
-LIMIT 1000
-"""
-
-df = pd.read_sql_query(sql, conn, params=params)
-
-# ----- Formatting helpers -----
+# ----- Formatting helpers (used by both tabs) -----
 def fmt_year(y) -> str:
-    """Full 4-digit year ('2026'), or empty."""
     return str(int(y)) if pd.notna(y) else ""
 
 
 def fmt_month(m) -> str:
-    """Dealer month notation: 'N5', 'N12', or empty."""
     return f"N{int(m)}" if pd.notna(m) else ""
 
 
 def fmt_price(hkd, usdt, eur=None) -> str:
-    """One price column. Prefers EUR > HKD > USDT. Currency suffix indicates
-    which one is being shown (EUR = €, USDT = ₮, HKD default = no suffix).
-    """
+    """Pretty-print in whichever native currency the seller used."""
     if pd.notna(eur):
         v = float(eur)
-        if v >= 1_000_000:
-            return f"{v/1_000_000:.2f}M €"
-        return f"{int(v/1_000):,}k €"
+        return f"{v/1_000_000:.2f}M €" if v >= 1_000_000 else f"{int(v/1_000):,}k €"
     if pd.notna(hkd):
         v = float(hkd)
-        if v >= 1_000_000:
-            return f"{v/1_000_000:.2f}M"
-        return f"{int(v/1_000):,}k"
+        return f"{v/1_000_000:.2f}M" if v >= 1_000_000 else f"{int(v/1_000):,}k"
     if pd.notna(usdt):
         u = float(usdt)
-        if u >= 1_000_000:
-            return f"{u/1_000_000:.2f}M ₮"
-        return f"{int(u/1_000):,}k ₮"
+        return f"{u/1_000_000:.2f}M ₮" if u >= 1_000_000 else f"{int(u/1_000):,}k ₮"
     return ""
 
 
+def fmt_usd(x) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    if x >= 1_000_000:
+        return f"${x/1_000_000:.2f}M"
+    return f"${int(x/1_000):,}k"
+
+
 def fmt_dial(color, details) -> str:
-    """Color + details combined, e.g. 'Black · Diamond' or 'Salmon · Pavé, Roman'."""
     parts = []
     if pd.notna(color) and color:
         parts.append(str(color))
@@ -245,78 +116,406 @@ def fmt_dial(color, details) -> str:
     return " · ".join(parts)
 
 
-# ----- Compact mobile table -----
-if len(df):
-    # Ref shows the reference; if a nickname was detected (YML, PN, ...) we
-    # append it in parens so the user can scan for it visually.
-    def _fmt_ref(row):
-        ref = row["reference"]
-        nick = row["nickname"]
-        return f"{ref} ({nick})" if isinstance(nick, str) and nick else ref
+st.title("Watch Prices")
 
-    df["Ref"] = df.apply(_fmt_ref, axis=1)
-    df["Year"] = df["year_made"].apply(fmt_year)
-    df["N"] = df["month_made"].apply(fmt_month)
-    df["Metal"] = df["metal"].fillna("")
-    df["Dial"] = df.apply(lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1)
-    # Description = the FULL original dealer line (raw_line), with nothing
-    # stripped or normalized. The user wants every detail visible — panda
-    # dial, tropical patina, bracelet vs leather, edition numbers, stickers,
-    # diamond placement, etc. — even if it means some emoji clutter.
-    df["Description"] = df["raw_line"].fillna("")
-    df["Price"] = df.apply(
-        lambda r: fmt_price(r["price_hkd"], r["price_usdt"], r.get("price_eur")),
-        axis=1,
+# ----- Top-level tabs -----
+tab_prices, tab_compare = st.tabs(["📋 Prices", "🔀 Compare markets"])
+
+# ==========================================================================
+# TAB 1 — Prices (single-market browse)
+# ==========================================================================
+with tab_prices:
+    # Persist selection across reruns / tab switches
+    if "market" not in st.session_state:
+        st.session_state.market = MARKETS_AVAILABLE[0]
+
+    market = st.radio(
+        "Market",
+        MARKETS_AVAILABLE,
+        format_func=lambda m: MARKET_LABEL.get(m, m.upper()),
+        horizontal=True,
+        key="market",
+        label_visibility="collapsed",
     )
 
-    # Compact metrics in a single row
-    hkd = df["price_hkd"].dropna()
-    if len(hkd):
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Matches", f"{len(df):,}")
-        m2.metric("Median", f"{int(hkd.median()/1000):,}k")
-        m3.metric("Low", f"{int(hkd.min()/1000):,}k")
-        m4.metric("High", f"{int(hkd.max()/1000):,}k")
-    else:
-        st.caption(f"{len(df):,} matches · prices in HKD")
+    conn = sqlite3.connect(db_path(market))
 
-    # Seven-column view. Metal (decoded from Rolex 6th digit) and the
-    # color-plus-details Dial column are separate so the user can scan both
-    # case material and dial features at a glance.
-    compact = df[["Ref", "Year", "N", "Metal", "Dial", "Description", "Price"]]
-    st.dataframe(
-        compact,
-        width="stretch",
-        hide_index=True,
-        height=min(620, 38 * (len(compact) + 1) + 3),
-        column_config={
-            "Ref": st.column_config.TextColumn(width="small"),
-            "Year": st.column_config.TextColumn(width="small"),
-            "N": st.column_config.TextColumn(width="small", help="Newly-delivered month"),
-            "Metal": st.column_config.TextColumn(width="small",
-                help="Case metal decoded from Rolex 6th digit"),
-            "Dial": st.column_config.TextColumn(width="medium"),
-            "Description": st.column_config.TextColumn(width="large"),
-            "Price": st.column_config.TextColumn(width="small"),
-        },
+    @st.cache_data(ttl=60)
+    def load_distinct(col: str, market: str) -> list[str]:
+        with sqlite3.connect(db_path(market)) as c:
+            rows = c.execute(
+                f"SELECT DISTINCT {col} FROM listings "
+                f"WHERE {col} IS NOT NULL ORDER BY {col}"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    @st.cache_data(ttl=60)
+    def overall_stats(market: str):
+        with sqlite3.connect(db_path(market)) as c:
+            total = c.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+            refs = c.execute("SELECT COUNT(DISTINCT reference) FROM listings").fetchone()[0]
+            min_d, max_d = c.execute(
+                "SELECT MIN(posted_at), MAX(posted_at) FROM listings"
+            ).fetchone()
+        return total, refs, min_d, max_d
+
+    total, n_refs, min_d, max_d = overall_stats(market)
+    st.caption(
+        f"{MARKET_LABEL.get(market, market.upper())} · {total:,} listings · "
+        f"{n_refs:,} refs · {min_d[:10]} → {max_d[:10]}"
     )
 
-    with st.expander("Show full row (brand, seller, phone, date, raw line)"):
-        # Split posted_at into Date + Time for the expander view
-        df["Date"] = df["posted_at"].str.slice(0, 10)
-        df["Time"] = df["posted_at"].str.slice(11, 16)
-        full = df[[
-            "Date", "Time", "reference", "nickname", "brand", "Year", "N",
-            "metal", "dial_color", "dial_details", "condition", "full_set",
-            "price_hkd", "price_usdt", "price_eur",
-            "seller", "seller_phone", "raw_line",
-        ]]
-        st.dataframe(full, width="stretch", hide_index=True)
-        st.download_button(
-            "Download CSV",
-            full.to_csv(index=False).encode("utf-8"),
-            "filtered_listings.csv",
-            "text/csv",
+    # ----- Filters -----
+    top1, top2 = st.columns([2, 1])
+    with top1:
+        ref = st.text_input(
+            "Reference", "", placeholder="e.g. 5167, 26240OR, RM035",
+            label_visibility="collapsed",
         )
-else:
-    st.info("No matches. Try a different reference or open 'More filters' to widen the search.")
+    with top2:
+        sort_by = st.selectbox(
+            "Sort",
+            ["Newest", "Price ↑", "Price ↓", "Year ↓"],
+            label_visibility="collapsed",
+        )
+
+    with st.expander("More filters", expanded=False):
+        f1, f2 = st.columns(2)
+        brands = load_distinct("brand", market)
+        brand = f1.selectbox("Brand", [""] + brands)
+        condition = f2.radio("Condition", ["any", "new", "used"], horizontal=True)
+
+        f3, f4 = st.columns(2)
+        color = f3.text_input("Color", "", placeholder="blue, salmon, ice blue")
+        details = f4.text_input("Details", "", placeholder="diamond, roman, pavé")
+
+        f5, f6 = st.columns(2)
+        full_set = f5.radio("Full set", ["any", "yes", "no"], horizontal=True)
+        seller = f6.text_input("Seller", "")
+
+        year_min, year_max = st.slider("Year made", 1990, 2030, (2010, 2026))
+
+    # ----- Build SQL -----
+    where = ["1=1"]
+    params: list = []
+    if ref:
+        where.append(
+            "(reference LIKE ? COLLATE NOCASE "
+            "OR nickname LIKE ? COLLATE NOCASE "
+            "OR raw_line LIKE ? COLLATE NOCASE)"
+        )
+        needle = f"%{ref}%"
+        params.extend([needle, needle, needle])
+    if brand:
+        where.append("brand = ?")
+        params.append(brand)
+    if color:
+        where.append(
+            "(dial_color LIKE ? COLLATE NOCASE "
+            "OR dial_details LIKE ? COLLATE NOCASE "
+            "OR raw_line LIKE ? COLLATE NOCASE)"
+        )
+        needle = f"%{color}%"
+        params.extend([needle, needle, needle])
+    if details:
+        where.append(
+            "(dial_details LIKE ? COLLATE NOCASE OR raw_line LIKE ? COLLATE NOCASE)"
+        )
+        needle = f"%{details}%"
+        params.extend([needle, needle])
+    where.append("(year_made IS NULL OR year_made BETWEEN ? AND ?)")
+    params.extend([year_min, year_max])
+    if condition != "any":
+        where.append("condition = ?")
+        params.append(condition)
+    if full_set != "any":
+        where.append("full_set = ?")
+        params.append(1 if full_set == "yes" else 0)
+    if seller:
+        where.append("seller LIKE ? COLLATE NOCASE")
+        params.append(f"%{seller}%")
+
+    order_clause = {
+        "Newest": "posted_at DESC",
+        "Price ↑": "COALESCE(price_hkd, price_usdt*7.8, price_eur*8.4) ASC NULLS LAST",
+        "Price ↓": "COALESCE(price_hkd, price_usdt*7.8, price_eur*8.4) DESC NULLS LAST",
+        "Year ↓": "year_made DESC NULLS LAST, posted_at DESC",
+    }[sort_by]
+
+    sql = f"""
+    SELECT posted_at, seller, seller_phone, brand, reference,
+           dial_color, dial_details, metal, nickname,
+           year_made, month_made, condition, full_set,
+           price_hkd, price_usdt, price_eur, clean_line, raw_line
+    FROM listings
+    WHERE {' AND '.join(where)}
+    ORDER BY {order_clause}
+    LIMIT 1000
+    """
+
+    df = pd.read_sql_query(sql, conn, params=params)
+
+    if len(df):
+        def _fmt_ref(row):
+            r = row["reference"]
+            n = row["nickname"]
+            return f"{r} ({n})" if isinstance(n, str) and n else r
+
+        df["Ref"] = df.apply(_fmt_ref, axis=1)
+        df["Year"] = df["year_made"].apply(fmt_year)
+        df["N"] = df["month_made"].apply(fmt_month)
+        df["Metal"] = df["metal"].fillna("")
+        df["Dial"] = df.apply(lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1)
+        df["Description"] = df["raw_line"].fillna("")
+        df["Price"] = df.apply(
+            lambda r: fmt_price(r["price_hkd"], r["price_usdt"], r.get("price_eur")),
+            axis=1,
+        )
+
+        hkd = df["price_hkd"].dropna()
+        if len(hkd):
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Matches", f"{len(df):,}")
+            m2.metric("Median", f"{int(hkd.median()/1000):,}k")
+            m3.metric("Low", f"{int(hkd.min()/1000):,}k")
+            m4.metric("High", f"{int(hkd.max()/1000):,}k")
+        else:
+            st.caption(f"{len(df):,} matches · prices in HKD")
+
+        compact = df[["Ref", "Year", "N", "Metal", "Dial", "Description", "Price"]]
+        st.dataframe(
+            compact,
+            width="stretch",
+            hide_index=True,
+            height=min(620, 38 * (len(compact) + 1) + 3),
+            column_config={
+                "Ref": st.column_config.TextColumn(width="small"),
+                "Year": st.column_config.TextColumn(width="small"),
+                "N": st.column_config.TextColumn(width="small", help="Newly-delivered month"),
+                "Metal": st.column_config.TextColumn(width="small",
+                    help="Case metal decoded from Rolex 6th digit"),
+                "Dial": st.column_config.TextColumn(width="medium"),
+                "Description": st.column_config.TextColumn(width="large"),
+                "Price": st.column_config.TextColumn(width="small"),
+            },
+        )
+
+        with st.expander("Show full row (brand, seller, phone, date, raw line)"):
+            df["Date"] = df["posted_at"].str.slice(0, 10)
+            df["Time"] = df["posted_at"].str.slice(11, 16)
+            full = df[[
+                "Date", "Time", "reference", "nickname", "brand", "Year", "N",
+                "metal", "dial_color", "dial_details", "condition", "full_set",
+                "price_hkd", "price_usdt", "price_eur",
+                "seller", "seller_phone", "raw_line",
+            ]]
+            st.dataframe(full, width="stretch", hide_index=True)
+            st.download_button(
+                "Download CSV",
+                full.to_csv(index=False).encode("utf-8"),
+                "filtered_listings.csv",
+                "text/csv",
+            )
+    else:
+        st.info("No matches. Try a different reference or open 'More filters' to widen.")
+
+# ==========================================================================
+# TAB 2 — Compare markets (same watch across HK / EU / Europe in USD)
+# ==========================================================================
+with tab_compare:
+    st.markdown(
+        "Enter a reference and see the same watch **across every market**. "
+        "Prices are all normalized to **USD** (HKD ÷ 7.8, EUR × 1.08, USDT 1:1). "
+        "Rows are grouped by exact spec (year + condition + dial details + "
+        "metal + full-set) so you're only comparing apples-to-apples."
+    )
+
+    cmp_ref = st.text_input(
+        "Reference", "",
+        placeholder="e.g. 5167R, 126500, 26240OR",
+        key="cmp_ref",
+    )
+
+    if cmp_ref:
+        # Pull matching rows from every available market DB, tag with market,
+        # combine.
+        all_rows = []
+        for m in MARKETS_AVAILABLE:
+            with sqlite3.connect(db_path(m)) as c:
+                mdf = pd.read_sql_query(
+                    """
+                    SELECT reference, brand, year_made, month_made,
+                           condition, dial_details, metal, full_set,
+                           price_hkd, price_usdt, price_eur,
+                           posted_at, seller, raw_line
+                    FROM listings
+                    WHERE reference LIKE ? COLLATE NOCASE
+                       OR raw_line LIKE ? COLLATE NOCASE
+                    """,
+                    c, params=[f"%{cmp_ref}%", f"%{cmp_ref}%"],
+                )
+            mdf["market"] = m
+            all_rows.append(mdf)
+
+        combined = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
+
+        if combined.empty:
+            st.info(f"No matches for '{cmp_ref}' in any market.")
+        else:
+            # Normalize to USD; drop rows without any price
+            combined["usd"] = combined.apply(
+                lambda r: row_to_usd(r["price_hkd"], r["price_usdt"], r["price_eur"]),
+                axis=1,
+            )
+            # Sanity floor: sub-$1k USD prices for these brands are almost
+            # always parser errors (a partial digit run mis-tagged as price).
+            # Also cap absurdly high — any single listing over $30M is noise.
+            combined = combined[
+                combined["usd"].notna()
+                & (combined["usd"] >= 1_000)
+                & (combined["usd"] <= 30_000_000)
+            ].copy()
+
+            if combined.empty:
+                st.info("Rows found but none had a parseable price.")
+            else:
+                # Build the spec signature. We keep exact year, condition,
+                # dial_details, metal, full_set — the user chose strict match.
+                # NULLs are normalized to '' so 'no dial detail' groups together.
+                def sig(row):
+                    return (
+                        str(row["reference"]).upper(),
+                        int(row["year_made"]) if pd.notna(row["year_made"]) else 0,
+                        str(row["condition"] or ""),
+                        str(row["dial_details"] or ""),
+                        str(row["metal"] or ""),
+                        int(row["full_set"]) if pd.notna(row["full_set"]) else -1,
+                    )
+                combined["_sig"] = combined.apply(sig, axis=1)
+
+                # Aggregate: for each signature, one row per market with
+                # count/min/med/max USD + one sample raw_line (the cheapest).
+                spec_rows = []
+                for sig_tuple, g in combined.groupby("_sig"):
+                    ref, year, cond, details_str, metal, fs = sig_tuple
+                    year_disp = str(year) if year else ""
+                    fs_disp = "fullset" if fs == 1 else ("naked" if fs == 0 else "")
+
+                    row_out = {
+                        "Ref": ref,
+                        "Year": year_disp,
+                        "Cond": cond,
+                        "Dial": details_str,
+                        "Metal": metal,
+                        "Full set": fs_disp,
+                    }
+
+                    per_market = {}
+                    for m in MARKETS_AVAILABLE:
+                        mg = g[g["market"] == m]
+                        if len(mg):
+                            usds = mg["usd"].dropna()
+                            per_market[m] = {
+                                "count": len(mg),
+                                "min": float(usds.min()),
+                                "med": float(usds.median()),
+                                "max": float(usds.max()),
+                                # Sample raw line — take the cheapest one so
+                                # the user can eyeball what drove the min.
+                                "raw": mg.sort_values("usd").iloc[0]["raw_line"],
+                            }
+                        else:
+                            per_market[m] = None
+
+                    # Only keep signatures present in ≥2 markets (that's the
+                    # whole point of the compare view). Toggle below to relax.
+                    if sum(1 for v in per_market.values() if v) < 2:
+                        continue
+
+                    # Populate per-market columns (min/med/max USD + count)
+                    for m in MARKETS_AVAILABLE:
+                        label = MARKET_SHORT[m]
+                        pm = per_market[m]
+                        if pm:
+                            row_out[f"{label} n"] = pm["count"]
+                            row_out[f"{label} min $"] = fmt_usd(pm["min"])
+                            row_out[f"{label} med $"] = fmt_usd(pm["med"])
+                            row_out[f"{label} max $"] = fmt_usd(pm["max"])
+                        else:
+                            row_out[f"{label} n"] = 0
+                            row_out[f"{label} min $"] = ""
+                            row_out[f"{label} med $"] = ""
+                            row_out[f"{label} max $"] = ""
+
+                    # Spread: (best sell price − cheapest buy price) as % of buy.
+                    market_medians = {
+                        m: per_market[m]["med"] for m in MARKETS_AVAILABLE if per_market[m]
+                    }
+                    market_mins = {
+                        m: per_market[m]["min"] for m in MARKETS_AVAILABLE if per_market[m]
+                    }
+                    if len(market_mins) >= 2:
+                        cheapest = min(market_mins.values())
+                        priciest_median = max(market_medians.values())
+                        spread_pct = (priciest_median - cheapest) / cheapest * 100
+                        row_out["Spread %"] = f"{spread_pct:+.1f}%"
+                        row_out["_spread_sort"] = spread_pct
+                    else:
+                        row_out["Spread %"] = ""
+                        row_out["_spread_sort"] = 0
+
+                    # Raw sample columns at the end (per user request)
+                    for m in MARKETS_AVAILABLE:
+                        label = MARKET_LABEL[m].split()[-1].strip("()")
+                        pm = per_market[m]
+                        row_out[f"{label} raw"] = pm["raw"] if pm else ""
+
+                    spec_rows.append(row_out)
+
+                if not spec_rows:
+                    st.info(
+                        f"Found '{cmp_ref}' but no spec matched in ≥2 markets. "
+                        f"Try a broader reference or check if the other markets "
+                        f"have that watch at all."
+                    )
+                else:
+                    out_df = pd.DataFrame(spec_rows).sort_values(
+                        "_spread_sort", ascending=False
+                    ).drop(columns=["_spread_sort"])
+
+                    st.caption(
+                        f"{len(out_df)} spec variant(s) present in ≥2 markets · "
+                        f"sorted by spread (biggest arbitrage first)"
+                    )
+
+                    st.dataframe(
+                        out_df,
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "Ref": st.column_config.TextColumn(width="small"),
+                            "Year": st.column_config.TextColumn(width="small"),
+                            "Cond": st.column_config.TextColumn(width="small"),
+                            "Dial": st.column_config.TextColumn(width="medium"),
+                            "Metal": st.column_config.TextColumn(width="small"),
+                            "Full set": st.column_config.TextColumn(width="small"),
+                            "Spread %": st.column_config.TextColumn(
+                                width="small",
+                                help="(priciest market median − cheapest market min) / cheapest min",
+                            ),
+                            **{
+                                f"{MARKET_SHORT[m]} raw": st.column_config.TextColumn(width="large",
+                                    help="Cheapest listing's original text — verify against source")
+                                for m in MARKETS_AVAILABLE
+                            },
+                        },
+                    )
+
+                    st.download_button(
+                        "Download comparison CSV",
+                        out_df.to_csv(index=False).encode("utf-8"),
+                        f"compare_{cmp_ref.replace('/', '-')}.csv",
+                        "text/csv",
+                    )
+    else:
+        st.caption("Enter a reference above to compare across markets.")

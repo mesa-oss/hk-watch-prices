@@ -1,48 +1,30 @@
 /* ==========================================================================
-   WhatsApp Web message extractor
+   WhatsApp Web message extractor  (v2 — more aggressive scroll triggers)
    --------------------------------------------------------------------------
-   Use when the WhatsApp "Export Chat" button is disabled but you're still a
-   group member with legitimate read access.
-
    HOW TO USE:
-     1. Open https://web.whatsapp.com in Chrome. Log in with the QR code.
-     2. Open the group you want to extract.
-     3. Optional: scroll UP as far as you care to go (this seeds the range).
-     4. Open DevTools:  View → Developer → Developer Tools  (or ⌥⌘I).
-        Click the "Console" tab.
-     5. Paste this ENTIRE file. Press Enter.
-     6. Wait. It scrolls upward slowly, capturing messages as they load.
-        You'll see progress like "1,234 messages so far..." in the console.
-     7. When it's done, a file called
-             whatsapp_chat_YYYY-MM-DD.txt
-        will download automatically.
-     8. Move that file to
-             ~/Projects/hk-watch-prices/exports/europe/YYYY-MM-DD_export.txt
-        (rename with today's date). Then run:
+     1. Open https://web.whatsapp.com in Chrome and log in.
+     2. Click into the target group chat.
+     3. Open DevTools (⌥⌘J → Console tab).
+     4. Type:  allow pasting  ↵   (only needed the first time)
+     5. Paste this entire file, press Enter.
+     6. Wait. Progress lines appear like "… 1,234 messages so far".
+     7. When it finishes, `whatsapp_chat_YYYY-MM-DD.txt` downloads.
+     8. Move it to  exports/europe/YYYY-MM-DD_export.txt  and run
              python3 src/refresh.py --market europe
-
-   FORMAT: the downloaded file mimics the format of WhatsApp's official
-   "Export chat" text file, so the same parser used for HK/EU works
-   unchanged.
    ========================================================================== */
 
 (async () => {
-  const messages = new Map();   // key → {date, time, sender, text}
-
-  // Extract WhatsApp meta line "[HH:MM, DD/MM/YYYY] Sender: "
+  const messages = new Map();
   const META_RE = /^\[(\d{1,2}:\d{2}(?::\d{2})?),\s*(\d{1,2}\/\d{1,2}\/\d{4})\]\s*(.+?):\s*$/;
 
   const capture = (root) => {
     let added = 0;
-    // WhatsApp attaches the timestamp+sender to every message bubble via
-    // data-pre-plain-text. Very stable attribute across WA-Web versions.
     root.querySelectorAll('[data-pre-plain-text]').forEach(el => {
       const meta = el.getAttribute('data-pre-plain-text');
       const m = meta.match(META_RE);
       if (!m) return;
       const [, time, date, sender] = m;
       const text = el.innerText.trim();
-      // dedup key — same message can render multiple times as user scrolls
       const key = `${date}|${time}|${sender}|${text.slice(0, 200)}`;
       if (!messages.has(key)) {
         messages.set(key, { date, time, sender, text });
@@ -52,8 +34,7 @@
     return added;
   };
 
-  // Catch messages as they appear (WhatsApp virtualizes; DOM nodes are
-  // created on scroll). Broad subtree observer is fine here.
+  // Watch the whole document — messages come in via various mount points.
   const observer = new MutationObserver(muts => {
     for (const mu of muts) {
       for (const n of mu.addedNodes) {
@@ -63,49 +44,106 @@
   });
   observer.observe(document.body, { childList: true, subtree: true });
 
-  // Initial sweep of whatever's in the DOM already
   capture(document);
-  console.log(`Starting extraction, ${messages.size} messages already visible…`);
+  console.log(`Starting extraction. ${messages.size} messages already visible.`);
 
-  // Locate the scrollable messages pane. WhatsApp changes selectors over
-  // time, so try a few candidates.
-  const findPane = () =>
-    document.querySelector('[data-testid="conversation-panel-messages"]') ||
-    document.querySelector('#main div[tabindex="0"][data-tab]') ||
-    document.querySelector('#main [role="application"]') ||
-    document.querySelector('#main .copyable-area');
-  const pane = findPane();
+  // Locate the scrollable pane by walking up from an existing message bubble
+  // to the nearest ancestor with vertical scrolling. Much more reliable than
+  // guessing CSS class names (WhatsApp scrambles those regularly).
+  const findScrollableAncestor = (el) => {
+    let node = el;
+    while (node && node !== document.body) {
+      const s = getComputedStyle(node);
+      if ((s.overflowY === 'auto' || s.overflowY === 'scroll') &&
+          node.scrollHeight > node.clientHeight + 10) {
+        return node;
+      }
+      node = node.parentElement;
+    }
+    return null;
+  };
+
+  let pane = null;
+  const sampleMsg = document.querySelector('[data-pre-plain-text]');
+  if (sampleMsg) pane = findScrollableAncestor(sampleMsg);
+  if (!pane) {
+    // Fallback: scan candidates
+    pane = document.querySelector('#main [role="application"]') ||
+           document.querySelector('#main');
+  }
   if (!pane) {
     observer.disconnect();
-    alert(
-      "Couldn't find the WhatsApp chat pane. Make sure you have a chat open, " +
-      "then try again."
-    );
+    alert("Couldn't find the chat pane. Open a chat and try again.");
     return;
   }
+  console.log('Scroll target:', pane, `scrollHeight=${pane.scrollHeight}`);
 
-  // Scroll toward the top; declare "done" when N consecutive scrolls yield
-  // no new messages. Tunables:
-  const IDLE_TICKS_UNTIL_DONE = 10;
-  const SCROLL_WAIT_MS = 1300;    // give lazy-load time to run
+  // Fire ALL of these on each iteration — WhatsApp's virtualized list responds
+  // to different triggers depending on version. Belt and suspenders.
+  const scrollUp = () => {
+    // 1) Direct scrollTop reset
+    pane.scrollTop = 0;
+    // 2) Wheel event with big negative delta (simulates fast wheel-up)
+    pane.dispatchEvent(new WheelEvent('wheel', {
+      deltaY: -3000, deltaMode: 0,
+      bubbles: true, cancelable: true, view: window,
+    }));
+    // 3) Focus + Home key (WhatsApp binds Home to jump-to-top)
+    pane.focus?.();
+    for (const target of [pane, document.activeElement, document.body]) {
+      if (!target) continue;
+      target.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Home', code: 'Home', keyCode: 36, which: 36,
+        bubbles: true, cancelable: true,
+      }));
+      target.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'PageUp', code: 'PageUp', keyCode: 33, which: 33,
+        bubbles: true, cancelable: true,
+      }));
+    }
+  };
 
+  // Bigger idle budget so slow servers don't cause premature stop.
+  const IDLE_TICKS_UNTIL_DONE = 25;
+  const SCROLL_WAIT_MS = 1500;
   let idleTicks = 0;
   let lastCount = messages.size;
+  let iter = 0;
+
   while (idleTicks < IDLE_TICKS_UNTIL_DONE) {
-    pane.scrollTop = 0;
+    scrollUp();
     await new Promise(r => setTimeout(r, SCROLL_WAIT_MS));
+    iter++;
     if (messages.size === lastCount) {
       idleTicks++;
+      // Every 5 idle ticks, log so user knows we're still trying
+      if (idleTicks % 5 === 0) {
+        console.log(`  (waiting — ${idleTicks}/${IDLE_TICKS_UNTIL_DONE} idle, `
+                    + `scrollHeight=${pane.scrollHeight}, scrollTop=${pane.scrollTop})`);
+      }
     } else {
       idleTicks = 0;
+      const delta = messages.size - lastCount;
       lastCount = messages.size;
-      console.log(`… ${messages.size.toLocaleString()} messages so far`);
+      console.log(`… ${messages.size.toLocaleString()} messages (+${delta})`);
     }
   }
-  observer.disconnect();
-  console.log(`Done. Captured ${messages.size.toLocaleString()} messages.`);
 
-  // Sort chronologically. Time may have seconds or not.
+  observer.disconnect();
+  console.log(`Done. Captured ${messages.size.toLocaleString()} messages after ${iter} scroll cycles.`);
+
+  if (messages.size < 100) {
+    console.warn(
+      '⚠️  Very few messages captured. Common causes:\n' +
+      '   • Group has "Disappearing messages" enabled → old ones gone.\n' +
+      '   • WhatsApp Web hasn\'t cached older history from your phone.\n' +
+      '     Open the chat on your PHONE, scroll back manually, then reload\n' +
+      '     web.whatsapp.com and re-run this script.\n' +
+      '   • This is a fresh group without much history.'
+    );
+  }
+
+  // Sort chronologically, format as WhatsApp export, download.
   const toDate = (d, t) => {
     const [dd, mm, yyyy] = d.split('/');
     const [hh, mi, se = '0'] = t.split(':');
@@ -114,17 +152,11 @@
   const rows = [...messages.values()].sort(
     (a, b) => toDate(a.date, a.time) - toDate(b.date, b.time)
   );
-
-  // Format like WhatsApp's own export: [DD/MM/YYYY HH:MM:SS] Sender: text
   const lines = rows.map(r => {
     const time = r.time.split(':').length === 2 ? `${r.time}:00` : r.time;
-    // Multi-line messages: keep newlines inside the message; the HK/EU
-    // parser already handles multi-line bodies.
     return `[${r.date} ${time}] ${r.sender}: ${r.text}`;
   });
   const content = lines.join('\n');
-
-  // Download as .txt
   const today = new Date().toISOString().slice(0, 10);
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -135,5 +167,5 @@
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
-  console.log(`Downloaded whatsapp_chat_${today}.txt — move it to exports/europe/`);
+  console.log(`Downloaded whatsapp_chat_${today}.txt`);
 })();
