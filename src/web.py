@@ -316,213 +316,366 @@ def render_market_view(market: str) -> None:
         )
 
 
-# ----- Top-level tabs: one per market + Compare -----
-tab_titles = [MARKET_LABEL[m] for m in MARKETS_AVAILABLE] + ["🔀 Compare"]
+def _spec_sig(row) -> tuple:
+    """Canonical spec signature — used to match same-watch listings across
+    markets. STRICT — every field must match exactly:
+      reference + year + month + condition + dial_details + metal + full_set
+
+    Month is included so an N4 delivery isn't compared to an N6 delivery
+    (different watches even though the ref is the same). NULL month matches
+    only other NULL months.
+    """
+    return (
+        str(row["reference"]).upper(),
+        int(row["year_made"]) if pd.notna(row["year_made"]) else 0,
+        int(row["month_made"]) if pd.notna(row["month_made"]) else 0,
+        str(row["condition"] or ""),
+        str(row["dial_details"] or ""),
+        str(row["metal"] or ""),
+        int(row["full_set"]) if pd.notna(row["full_set"]) else -1,
+    )
+
+
+def render_deal_finder(buy_market: str, ref_market: str) -> None:
+    """Browse listings from `buy_market` with the cheapest same-spec price
+    from `ref_market` attached to each row. Rank by delta so opportunities
+    where you can buy cheaper than the reference market's floor float to
+    the top — matches the user's real workflow.
+    """
+    key = f"deal_{buy_market}_{ref_market}"
+
+    # --- Filters (mirror the HK tab, all applied to the BUY market) ---
+    top1, top2 = st.columns([2, 1])
+    with top1:
+        ref = st.text_input(
+            "Reference", "", placeholder="e.g. 5167, 26240OR, RM035",
+            label_visibility="collapsed", key=f"{key}_ref",
+        )
+    with top2:
+        sort_by = st.selectbox(
+            "Sort",
+            ["Best deal", "Delta $ ↓", "Buy price ↑", "Buy price ↓", "Newest"],
+            label_visibility="collapsed", key=f"{key}_sort",
+        )
+
+    with st.expander("More filters", expanded=False):
+        f1, f2 = st.columns(2)
+        brands = load_distinct("brand", buy_market)
+        brand = f1.selectbox("Brand", [""] + brands, key=f"{key}_brand")
+        condition = f2.radio("Condition", ["any", "new", "used"],
+                             horizontal=True, key=f"{key}_cond")
+
+        f3, f4 = st.columns(2)
+        color = f3.text_input("Color", "", placeholder="blue, salmon",
+                              key=f"{key}_color")
+        details = f4.text_input("Details", "", placeholder="diamond, roman",
+                                key=f"{key}_details")
+
+        f5, f6 = st.columns(2)
+        full_set = f5.radio("Full set", ["any", "yes", "no"],
+                            horizontal=True, key=f"{key}_fs")
+        seller = f6.text_input("Seller", "", key=f"{key}_seller")
+
+        year_min, year_max = st.slider("Year made", 1990, 2030, (2010, 2026),
+                                       key=f"{key}_year")
+
+    # --- Build BUY-market SQL (same filter shape as HK tab) ---
+    where = ["1=1"]
+    params: list = []
+    if ref:
+        where.append(
+            "(reference LIKE ? COLLATE NOCASE "
+            "OR nickname LIKE ? COLLATE NOCASE "
+            "OR raw_line LIKE ? COLLATE NOCASE)"
+        )
+        needle = f"%{ref}%"
+        params.extend([needle, needle, needle])
+    if brand:
+        where.append("brand = ?")
+        params.append(brand)
+    if color:
+        where.append(
+            "(dial_color LIKE ? COLLATE NOCASE "
+            "OR dial_details LIKE ? COLLATE NOCASE "
+            "OR raw_line LIKE ? COLLATE NOCASE)"
+        )
+        needle = f"%{color}%"
+        params.extend([needle, needle, needle])
+    if details:
+        where.append(
+            "(dial_details LIKE ? COLLATE NOCASE OR raw_line LIKE ? COLLATE NOCASE)"
+        )
+        needle = f"%{details}%"
+        params.extend([needle, needle])
+    where.append("(year_made IS NULL OR year_made BETWEEN ? AND ?)")
+    params.extend([year_min, year_max])
+    if condition != "any":
+        where.append("condition = ?")
+        params.append(condition)
+    if full_set != "any":
+        where.append("full_set = ?")
+        params.append(1 if full_set == "yes" else 0)
+    if seller:
+        where.append("seller LIKE ? COLLATE NOCASE")
+        params.append(f"%{seller}%")
+
+    sql = f"""
+    SELECT posted_at, seller, seller_phone, brand, reference,
+           dial_color, dial_details, metal, nickname,
+           year_made, month_made, condition, full_set,
+           price_hkd, price_usdt, price_eur, raw_line
+    FROM listings
+    WHERE {' AND '.join(where)}
+    ORDER BY posted_at DESC
+    LIMIT 2000
+    """
+
+    with sqlite3.connect(db_path(buy_market)) as conn:
+        buy_df = pd.read_sql_query(sql, conn, params=params)
+
+    if not len(buy_df):
+        st.info(
+            f"No {MARKET_LABEL[buy_market]} listings match those filters. "
+            f"Widen the filters or try another reference."
+        )
+        return
+
+    # Normalize buy-side price to USD with sanity floor
+    buy_df["buy_usd"] = buy_df.apply(
+        lambda r: row_to_usd(r["price_hkd"], r["price_usdt"], r["price_eur"]),
+        axis=1,
+    )
+    buy_df = buy_df[
+        buy_df["buy_usd"].notna()
+        & (buy_df["buy_usd"] >= 1_000)
+        & (buy_df["buy_usd"] <= 30_000_000)
+    ].copy()
+
+    if not len(buy_df):
+        st.info("Filters matched rows but none had a parseable price.")
+        return
+
+    # --- Load REFERENCE market, aggregate by signature (MIN price per spec) ---
+    # Only pull refs we actually need to reduce load.
+    refs_needed = tuple(buy_df["reference"].dropna().unique())
+    if not refs_needed:
+        st.info("No matchable references in the buy-side selection.")
+        return
+    placeholders = ",".join("?" for _ in refs_needed)
+    with sqlite3.connect(db_path(ref_market)) as conn:
+        ref_df = pd.read_sql_query(
+            f"""
+            SELECT reference, year_made, month_made, condition, dial_details,
+                   metal, full_set, price_hkd, price_usdt, price_eur,
+                   raw_line, posted_at, seller, seller_phone
+            FROM listings
+            WHERE reference IN ({placeholders}) COLLATE NOCASE
+            """,
+            conn, params=list(refs_needed),
+        )
+
+    ref_df["ref_usd"] = ref_df.apply(
+        lambda r: row_to_usd(r["price_hkd"], r["price_usdt"], r["price_eur"]),
+        axis=1,
+    )
+    ref_df = ref_df[
+        ref_df["ref_usd"].notna()
+        & (ref_df["ref_usd"] >= 1_000)
+        & (ref_df["ref_usd"] <= 30_000_000)
+    ].copy()
+
+    if not len(ref_df):
+        st.info(
+            f"{MARKET_LABEL[ref_market]} has no comparable listings for these refs."
+        )
+        return
+
+    # Aggregate ref market by signature → min price + count + cheapest
+    # listing's metadata (seller, phone, posted_at, raw_line).
+    ref_df["_sig"] = ref_df.apply(_spec_sig, axis=1)
+    agg = (
+        ref_df.sort_values("ref_usd")
+        .groupby("_sig")
+        .agg(
+            ref_min_usd=("ref_usd", "min"),
+            ref_med_usd=("ref_usd", "median"),
+            ref_n=("ref_usd", "size"),
+            ref_raw=("raw_line", "first"),        # cheapest listing (sorted)
+            ref_seller=("seller", "first"),
+            ref_phone=("seller_phone", "first"),
+            ref_posted=("posted_at", "first"),
+        )
+        .reset_index()
+    )
+
+    # Merge buy listings with ref-market signature aggregate (inner join —
+    # rows with no comparable in ref market are dropped, since without a
+    # comparison there's nothing to score).
+    buy_df["_sig"] = buy_df.apply(_spec_sig, axis=1)
+    merged = buy_df.merge(agg, on="_sig", how="inner")
+
+    if not len(merged):
+        st.info(
+            f"Buy-side has {len(buy_df):,} listings but none have a matching "
+            f"same-spec listing in {MARKET_LABEL[ref_market]}. "
+            f"Try loosening filters or wait for more data."
+        )
+        return
+
+    # --- Score & sort ---
+    merged["delta_usd"] = merged["ref_min_usd"] - merged["buy_usd"]
+    merged["delta_pct"] = merged["delta_usd"] / merged["buy_usd"] * 100
+
+    if sort_by == "Best deal":
+        merged = merged.sort_values("delta_pct", ascending=False)
+    elif sort_by == "Delta $ ↓":
+        merged = merged.sort_values("delta_usd", ascending=False)
+    elif sort_by == "Buy price ↑":
+        merged = merged.sort_values("buy_usd", ascending=True)
+    elif sort_by == "Buy price ↓":
+        merged = merged.sort_values("buy_usd", ascending=False)
+    else:  # Newest
+        merged = merged.sort_values("posted_at", ascending=False)
+
+    # --- Display formatting ---
+    def _fmt_ref(row):
+        r = row["reference"]
+        n = row["nickname"]
+        return f"{r} ({n})" if isinstance(n, str) and n else r
+
+    merged["Ref"] = merged.apply(_fmt_ref, axis=1)
+    merged["Year"] = merged["year_made"].apply(fmt_year)
+    merged["N"] = merged["month_made"].apply(fmt_month)
+    merged["Cond"] = merged["condition"].fillna("").str.slice(0, 4)
+    merged["Metal"] = merged["metal"].fillna("")
+    merged["Dial"] = merged.apply(
+        lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1,
+    )
+    merged["Buy $"] = merged["buy_usd"].apply(fmt_usd)
+    ref_label = MARKET_SHORT[ref_market]
+    buy_label = MARKET_SHORT[buy_market]
+    merged[f"{ref_label} min $"] = merged["ref_min_usd"].apply(fmt_usd)
+    merged[f"{ref_label} n"] = merged["ref_n"]
+    merged["Delta $"] = merged["delta_usd"].apply(lambda x: fmt_usd(x) if x >= 0 else f"−{fmt_usd(-x)}")
+    merged["Delta %"] = merged["delta_pct"].apply(lambda x: f"{x:+.1f}%")
+
+    # Publication date + seller contact for BOTH sides so you can act quickly
+    merged[f"{buy_label} date"] = merged["posted_at"].str.slice(0, 10)
+    merged[f"{buy_label} seller"] = merged["seller"].fillna("")
+    # Prefer explicit phone if we detected one; otherwise leave blank (the
+    # seller column already shows the phone-as-name when that's all we have)
+    merged[f"{buy_label} phone"] = merged["seller_phone"].fillna("")
+
+    merged[f"{ref_label} date"] = merged["ref_posted"].str.slice(0, 10)
+    merged[f"{ref_label} seller"] = merged["ref_seller"].fillna("")
+    merged[f"{ref_label} phone"] = merged["ref_phone"].fillna("")
+
+    merged["Buy raw"] = merged["raw_line"].fillna("")
+    merged[f"{ref_label} raw"] = merged["ref_raw"].fillna("")
+
+    # Summary metrics
+    profitable = (merged["delta_pct"] > 0).sum()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Comparable", f"{len(merged):,}")
+    m2.metric("Positive delta", f"{profitable:,}",
+              f"{profitable/len(merged)*100:.0f}%" if len(merged) else "")
+    if len(merged):
+        m3.metric("Best delta %", f"{merged['delta_pct'].max():+.1f}%")
+        m4.metric("Best delta $", fmt_usd(merged['delta_usd'].max()))
+
+    display = merged[[
+        "Ref", "Year", "N", "Cond", "Metal", "Dial",
+        "Buy $", f"{ref_label} min $", f"{ref_label} n",
+        "Delta $", "Delta %",
+        # Contact info: date + seller + phone for both sides so you can
+        # jump straight to WhatsApp
+        f"{buy_label} date", f"{buy_label} seller", f"{buy_label} phone",
+        f"{ref_label} date", f"{ref_label} seller", f"{ref_label} phone",
+        "Buy raw", f"{ref_label} raw",
+    ]]
+
+    st.dataframe(
+        display,
+        width="stretch",
+        hide_index=True,
+        height=min(700, 38 * (len(display) + 1) + 3),
+        column_config={
+            "Ref": st.column_config.TextColumn(width="small"),
+            "Year": st.column_config.TextColumn(width="small"),
+            "N": st.column_config.TextColumn(width="small"),
+            "Cond": st.column_config.TextColumn(width="small"),
+            "Metal": st.column_config.TextColumn(width="small"),
+            "Dial": st.column_config.TextColumn(width="medium"),
+            "Buy $": st.column_config.TextColumn(width="small",
+                help=f"{MARKET_LABEL[buy_market]} listing price in USD"),
+            f"{ref_label} min $": st.column_config.TextColumn(width="small",
+                help=f"Cheapest same-spec {MARKET_LABEL[ref_market]} listing"),
+            f"{ref_label} n": st.column_config.NumberColumn(width="small",
+                help=f"# of same-spec listings in {MARKET_LABEL[ref_market]}"),
+            "Delta $": st.column_config.TextColumn(width="small",
+                help=f"{ref_label} min − Buy (positive = buy here, sell in {ref_label})"),
+            "Delta %": st.column_config.TextColumn(width="small"),
+            f"{buy_label} date": st.column_config.TextColumn(width="small",
+                help="When the buy-side listing was posted"),
+            f"{buy_label} seller": st.column_config.TextColumn(width="medium",
+                help="Seller name (or phone if not in your contacts)"),
+            f"{buy_label} phone": st.column_config.TextColumn(width="medium",
+                help="Explicit phone (when seller isn't a saved contact)"),
+            f"{ref_label} date": st.column_config.TextColumn(width="small"),
+            f"{ref_label} seller": st.column_config.TextColumn(width="medium"),
+            f"{ref_label} phone": st.column_config.TextColumn(width="medium"),
+            "Buy raw": st.column_config.TextColumn(width="large",
+                help=f"Original {MARKET_LABEL[buy_market]} dealer text"),
+            f"{ref_label} raw": st.column_config.TextColumn(width="large",
+                help=f"Cheapest {MARKET_LABEL[ref_market]} same-spec listing's text"),
+        },
+    )
+
+    st.download_button(
+        "Download comparison CSV",
+        display.to_csv(index=False).encode("utf-8"),
+        f"deals_{buy_market}_vs_{ref_market}.csv",
+        "text/csv",
+        key=f"{key}_dl",
+    )
+
+
+# ----- Top-level tabs: one per market + Deal Finder -----
+tab_titles = [MARKET_LABEL[m] for m in MARKETS_AVAILABLE] + ["🔀 Deal Finder"]
 tabs = st.tabs(tab_titles)
 
 for i, m in enumerate(MARKETS_AVAILABLE):
     with tabs[i]:
         render_market_view(m)
 
-tab_compare = tabs[-1]
-
 # ==========================================================================
-# TAB 2 — Compare markets (same watch across HK / EU / Europe in USD)
+# LAST TAB — Deal Finder (buy-side listings + reference-market cheapest)
 # ==========================================================================
-with tab_compare:
+with tabs[-1]:
     st.markdown(
-        "Enter a reference and see the same watch **across every market**. "
-        "Prices are all normalized to **USD** (HKD ÷ 7.8, EUR × 1.08, USDT 1:1). "
-        "Rows are grouped by exact spec (year + condition + dial details + "
-        "metal + full-set) so you're only comparing apples-to-apples."
+        "**Browse listings from one market with the cheapest same-spec price "
+        "from another market attached.** Delta = reference-market cheapest "
+        "minus this listing's price, both in USD (HKD ÷ 7.8, EUR × 1.08). "
+        "Positive delta = you'd buy on the left, sell on the right."
     )
 
-    cmp_ref = st.text_input(
-        "Reference", "",
-        placeholder="e.g. 5167R, 126500, 26240OR",
-        key="cmp_ref",
-    )
+    dm1, dm2 = st.columns(2)
+    with dm1:
+        buy_market = st.selectbox(
+            "🛒 Browse (buy here)",
+            MARKETS_AVAILABLE,
+            index=(MARKETS_AVAILABLE.index("eu") if "eu" in MARKETS_AVAILABLE else 0),
+            format_func=lambda m: MARKET_LABEL[m],
+            key="deal_buy_market",
+        )
+    with dm2:
+        ref_options = [m for m in MARKETS_AVAILABLE if m != buy_market]
+        ref_market = st.selectbox(
+            "🏷️ Reference market (sell here)",
+            ref_options,
+            index=(ref_options.index("hk") if "hk" in ref_options else 0),
+            format_func=lambda m: MARKET_LABEL[m],
+            key="deal_ref_market",
+        )
 
-    if cmp_ref:
-        # Pull matching rows from every available market DB, tag with market,
-        # combine.
-        all_rows = []
-        for m in MARKETS_AVAILABLE:
-            with sqlite3.connect(db_path(m)) as c:
-                mdf = pd.read_sql_query(
-                    """
-                    SELECT reference, brand, year_made, month_made,
-                           condition, dial_details, metal, full_set,
-                           price_hkd, price_usdt, price_eur,
-                           posted_at, seller, raw_line
-                    FROM listings
-                    WHERE reference LIKE ? COLLATE NOCASE
-                       OR raw_line LIKE ? COLLATE NOCASE
-                    """,
-                    c, params=[f"%{cmp_ref}%", f"%{cmp_ref}%"],
-                )
-            mdf["market"] = m
-            all_rows.append(mdf)
-
-        combined = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
-
-        if combined.empty:
-            st.info(f"No matches for '{cmp_ref}' in any market.")
-        else:
-            # Normalize to USD; drop rows without any price
-            combined["usd"] = combined.apply(
-                lambda r: row_to_usd(r["price_hkd"], r["price_usdt"], r["price_eur"]),
-                axis=1,
-            )
-            # Sanity floor: sub-$1k USD prices for these brands are almost
-            # always parser errors (a partial digit run mis-tagged as price).
-            # Also cap absurdly high — any single listing over $30M is noise.
-            combined = combined[
-                combined["usd"].notna()
-                & (combined["usd"] >= 1_000)
-                & (combined["usd"] <= 30_000_000)
-            ].copy()
-
-            if combined.empty:
-                st.info("Rows found but none had a parseable price.")
-            else:
-                # Build the spec signature. We keep exact year, condition,
-                # dial_details, metal, full_set — the user chose strict match.
-                # NULLs are normalized to '' so 'no dial detail' groups together.
-                def sig(row):
-                    return (
-                        str(row["reference"]).upper(),
-                        int(row["year_made"]) if pd.notna(row["year_made"]) else 0,
-                        str(row["condition"] or ""),
-                        str(row["dial_details"] or ""),
-                        str(row["metal"] or ""),
-                        int(row["full_set"]) if pd.notna(row["full_set"]) else -1,
-                    )
-                combined["_sig"] = combined.apply(sig, axis=1)
-
-                # Aggregate: for each signature, one row per market with
-                # count/min/med/max USD + one sample raw_line (the cheapest).
-                spec_rows = []
-                for sig_tuple, g in combined.groupby("_sig"):
-                    ref, year, cond, details_str, metal, fs = sig_tuple
-                    year_disp = str(year) if year else ""
-                    fs_disp = "fullset" if fs == 1 else ("naked" if fs == 0 else "")
-
-                    row_out = {
-                        "Ref": ref,
-                        "Year": year_disp,
-                        "Cond": cond,
-                        "Dial": details_str,
-                        "Metal": metal,
-                        "Full set": fs_disp,
-                    }
-
-                    per_market = {}
-                    for m in MARKETS_AVAILABLE:
-                        mg = g[g["market"] == m]
-                        if len(mg):
-                            usds = mg["usd"].dropna()
-                            per_market[m] = {
-                                "count": len(mg),
-                                "min": float(usds.min()),
-                                "med": float(usds.median()),
-                                "max": float(usds.max()),
-                                # Sample raw line — take the cheapest one so
-                                # the user can eyeball what drove the min.
-                                "raw": mg.sort_values("usd").iloc[0]["raw_line"],
-                            }
-                        else:
-                            per_market[m] = None
-
-                    # Only keep signatures present in ≥2 markets (that's the
-                    # whole point of the compare view). Toggle below to relax.
-                    if sum(1 for v in per_market.values() if v) < 2:
-                        continue
-
-                    # Populate per-market columns (min/med/max USD + count)
-                    for m in MARKETS_AVAILABLE:
-                        label = MARKET_SHORT[m]
-                        pm = per_market[m]
-                        if pm:
-                            row_out[f"{label} n"] = pm["count"]
-                            row_out[f"{label} min $"] = fmt_usd(pm["min"])
-                            row_out[f"{label} med $"] = fmt_usd(pm["med"])
-                            row_out[f"{label} max $"] = fmt_usd(pm["max"])
-                        else:
-                            row_out[f"{label} n"] = 0
-                            row_out[f"{label} min $"] = ""
-                            row_out[f"{label} med $"] = ""
-                            row_out[f"{label} max $"] = ""
-
-                    # Spread: (best sell price − cheapest buy price) as % of buy.
-                    market_medians = {
-                        m: per_market[m]["med"] for m in MARKETS_AVAILABLE if per_market[m]
-                    }
-                    market_mins = {
-                        m: per_market[m]["min"] for m in MARKETS_AVAILABLE if per_market[m]
-                    }
-                    if len(market_mins) >= 2:
-                        cheapest = min(market_mins.values())
-                        priciest_median = max(market_medians.values())
-                        spread_pct = (priciest_median - cheapest) / cheapest * 100
-                        row_out["Spread %"] = f"{spread_pct:+.1f}%"
-                        row_out["_spread_sort"] = spread_pct
-                    else:
-                        row_out["Spread %"] = ""
-                        row_out["_spread_sort"] = 0
-
-                    # Raw sample columns at the end (per user request)
-                    for m in MARKETS_AVAILABLE:
-                        label = MARKET_LABEL[m].split()[-1].strip("()")
-                        pm = per_market[m]
-                        row_out[f"{label} raw"] = pm["raw"] if pm else ""
-
-                    spec_rows.append(row_out)
-
-                if not spec_rows:
-                    st.info(
-                        f"Found '{cmp_ref}' but no spec matched in ≥2 markets. "
-                        f"Try a broader reference or check if the other markets "
-                        f"have that watch at all."
-                    )
-                else:
-                    out_df = pd.DataFrame(spec_rows).sort_values(
-                        "_spread_sort", ascending=False
-                    ).drop(columns=["_spread_sort"])
-
-                    st.caption(
-                        f"{len(out_df)} spec variant(s) present in ≥2 markets · "
-                        f"sorted by spread (biggest arbitrage first)"
-                    )
-
-                    st.dataframe(
-                        out_df,
-                        width="stretch",
-                        hide_index=True,
-                        column_config={
-                            "Ref": st.column_config.TextColumn(width="small"),
-                            "Year": st.column_config.TextColumn(width="small"),
-                            "Cond": st.column_config.TextColumn(width="small"),
-                            "Dial": st.column_config.TextColumn(width="medium"),
-                            "Metal": st.column_config.TextColumn(width="small"),
-                            "Full set": st.column_config.TextColumn(width="small"),
-                            "Spread %": st.column_config.TextColumn(
-                                width="small",
-                                help="(priciest market median − cheapest market min) / cheapest min",
-                            ),
-                            **{
-                                f"{MARKET_SHORT[m]} raw": st.column_config.TextColumn(width="large",
-                                    help="Cheapest listing's original text — verify against source")
-                                for m in MARKETS_AVAILABLE
-                            },
-                        },
-                    )
-
-                    st.download_button(
-                        "Download comparison CSV",
-                        out_df.to_csv(index=False).encode("utf-8"),
-                        f"compare_{cmp_ref.replace('/', '-')}.csv",
-                        "text/csv",
-                    )
-    else:
-        st.caption("Enter a reference above to compare across markets.")
+    render_deal_finder(buy_market, ref_market)
