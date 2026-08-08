@@ -48,7 +48,13 @@ st.markdown(
 )
 
 # ----- Market discovery -----
-MARKETS_AVAILABLE = [m for m in ("hk", "eu", "wdg") if db_path(m).exists()]
+# Reuven ('eu') is temporarily hidden from the app while WDG becomes the
+# primary EU source. DB stays on disk — remove this override to re-enable.
+_HIDDEN_MARKETS = {"eu"}
+MARKETS_AVAILABLE = [
+    m for m in ("hk", "eu", "wdg")
+    if db_path(m).exists() and m not in _HIDDEN_MARKETS
+]
 if not MARKETS_AVAILABLE:
     st.error("No databases found. Run `python src/refresh.py` first.")
     st.stop()
@@ -822,7 +828,12 @@ def render_top_deals() -> None:
              hk_raw=("raw_line", "first"),
              hk_seller=("seller", "first"),
              hk_phone=("seller_phone", "first"),
-             hk_posted=("posted_at", "first"))
+             hk_posted=("posted_at", "first"),
+             # Also pull year/month of the CHEAPEST HK listing (all listings
+             # in a group share the same sig, but we grab .first() to have
+             # something concrete to display against the EU side).
+             hk_year=("year_made", "first"),
+             hk_month=("month_made", "first"))
         .reset_index()
     )
 
@@ -869,6 +880,11 @@ def render_top_deals() -> None:
     )
     merged["Src"] = merged["source"].map({m: MARKET_SHORT[m] for m in eu_sources})
     merged["EU $"] = merged["buy_usd"].apply(fmt_usd)
+    # HK-side year + N surfaced so the user can verify the sig match at a
+    # glance. Same-sig rows must have matching year and month — if these
+    # columns differ from EU Year/N, the parser missed a value somewhere.
+    merged["HK Year"] = merged["hk_year"].apply(fmt_year)
+    merged["HK N"] = merged["hk_month"].apply(fmt_month)
     merged["HK min $"] = merged["hk_min_usd"].apply(fmt_usd)
     merged["HK n"] = merged["hk_n"]
     merged["Delta $"] = merged["delta_usd"].apply(fmt_usd)
@@ -891,7 +907,8 @@ def render_top_deals() -> None:
 
     display = merged[[
         "Src", "Ref", "Year", "N", "Cond", "Metal", "Dial",
-        "EU $", "HK min $", "HK n", "Delta $", "Delta %",
+        "EU $", "HK Year", "HK N", "HK min $", "HK n",
+        "Delta $", "Delta %",
         "EU date", "EU seller", "EU phone",
         "HK date", "HK seller", "HK phone",
         "EU raw", "HK raw",
@@ -912,6 +929,10 @@ def render_top_deals() -> None:
             "Metal": st.column_config.TextColumn(width="small"),
             "Dial": st.column_config.TextColumn(width="medium"),
             "EU $": st.column_config.TextColumn(width="small"),
+            "HK Year": st.column_config.TextColumn(width="small",
+                help="Year of the HK listing being compared — should match EU Year"),
+            "HK N": st.column_config.TextColumn(width="small",
+                help="Month of the HK listing — should match EU N"),
             "HK min $": st.column_config.TextColumn(width="small"),
             "HK n": st.column_config.NumberColumn(width="small"),
             "Delta $": st.column_config.TextColumn(width="small"),
