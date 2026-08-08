@@ -326,26 +326,40 @@ def _extract_eur(line: str) -> int | None:
     This is opposite to the HKD `1.82m` convention where '.' is decimal
     (1.82 million). Only EUR-marked amounts run through this parser.
     """
-    # Accept ‘ (curly) as apostrophe, plus straight ' and dot / comma / thin
-    # space. Strip * bold markers so `*12.500€*` matches.
+    # 1) k/m suffix forms first — unambiguous once you see the k or m.
+    # "€10.3k" → 10300, "€1.5m" → 1500000.
+    for pat in [
+        re.compile(r"€\s*(\d+(?:\.\d+)?)\s*([kKmM]|mil)\b"),
+        re.compile(r"(\d+(?:\.\d+)?)\s*([kKmM]|mil)\s*€"),
+        re.compile(r"EUR\s*(\d+(?:\.\d+)?)\s*([kKmM]|mil)\b", re.I),
+        re.compile(r"(\d+(?:\.\d+)?)\s*([kKmM]|mil)\s*EUR\b", re.I),
+    ]:
+        m = pat.search(line)
+        if m:
+            try:
+                amt = float(m.group(1))
+            except ValueError:
+                continue
+            suf = m.group(2).lower()
+            amt *= 1_000 if suf == "k" else 1_000_000
+            if 500 <= amt <= 20_000_000:
+                return int(amt)
+
+    # 2) European thousands-separator formats (no k/m suffix)
     pats = [
-        # amount then €
-        re.compile(r"(\d{1,3}(?:[\.,'’ \s]\d{3})+|\d{4,7})\s*€"),
-        # € then amount
-        re.compile(r"€\s*(\d{1,3}(?:[\.,'’ \s]\d{3})+|\d{4,7})"),
-        # EUR word form
-        re.compile(r"\bEUR\s*:?\s*(\d[\d\.,'’ \s]*)", re.I),
-        re.compile(r"(\d[\d\.,'’ \s]*)\s*EUR\b", re.I),
+        re.compile(r"(\d{1,3}(?:[\.,\'’ \s]\d{3})+)\s*€"),
+        re.compile(r"€\s*(\d{1,3}(?:[\.,\'’ \s]\d{3})+)"),
+        re.compile(r"(\d{4,7})\s*€"),
+        re.compile(r"€\s*(\d{4,7})"),
+        re.compile(r"\bEUR\s*:?\s*(\d[\d\.,\'’ \s]*)", re.I),
+        re.compile(r"(\d[\d\.,\'’ \s]*)\s*EUR\b", re.I),
     ]
     for pat in pats:
         for m in pat.finditer(line):
-            amt_str = m.group(1)
-            # Strip every thousands separator to leave pure digits
-            digits = re.sub(r"[^\d]", "", amt_str)
+            digits = re.sub(r"[^\d]", "", m.group(1))
             if not digits or len(digits) < 3:
                 continue
             amt = int(digits)
-            # Sanity: EUR watch prices realistically 1k–20M
             if 500 <= amt <= 20_000_000:
                 return amt
     return None
@@ -400,11 +414,12 @@ def extract_price(line: str) -> tuple[int | None, int | None, int | None, str]:
                     hkd = int(amt)
     # Fallback 1: a bare `<num>k` or `<num>m` suffix (no currency word) — these
     # are HKD by default in HK price lists. e.g. "ref Black 2024 720k"
-    if hkd is None and usdt is None:
-        # Find numbers that aren't part of a reference (no letter immediately
-        # before the digits). Restrict to numbers followed by k/m at line/word end.
+    # Skip if EUR was already captured (avoids '€10.3k' being counted as both
+    # EUR 10300 AND HKD 10300).
+    if hkd is None and usdt is None and eur is None:
+        # Find numbers not preceded by a letter or currency symbol.
         for m in re.finditer(
-            r"(?<![A-Za-z\-/])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*([kKmM]|mil|MIL)\b",
+            r"(?<![A-Za-z\-/€])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*([kKmM]|mil|MIL)\b",
             line,
         ):
             amt_str = m.group(1).replace(",", "")
@@ -799,7 +814,11 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
     ref = extract_reference(line)
     if not ref:
         return None
-    hkd, usdt, eur, _ = extract_price(line)
+    # Mask the reference out of the line before price extraction so the
+    # bare-number fallback can't mistake the ref for a price. Fixes cases
+    # like 'Rolex 124060' where 124060 was captured as HKD 124,060.
+    line_for_price = re.sub(re.escape(ref), " " * len(ref), line, flags=re.IGNORECASE)
+    hkd, usdt, eur, _ = extract_price(line_for_price)
     if hkd is None and usdt is None and eur is None:
         return None
     condition, full_set = extract_condition(line)
