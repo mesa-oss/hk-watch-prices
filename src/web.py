@@ -118,84 +118,77 @@ def fmt_dial(color, details) -> str:
 
 st.title("Watch Prices")
 
-# ----- Top-level tabs -----
-tab_prices, tab_compare = st.tabs(["📋 Prices", "🔀 Compare markets"])
 
-# ==========================================================================
-# TAB 1 — Prices (single-market browse)
-# ==========================================================================
-with tab_prices:
-    # Persist selection across reruns / tab switches
-    if "market" not in st.session_state:
-        st.session_state.market = MARKETS_AVAILABLE[0]
+# ----- Cached DB helpers (shared across all market tabs) -----
+@st.cache_data(ttl=60)
+def load_distinct(col: str, market: str) -> list[str]:
+    with sqlite3.connect(db_path(market)) as c:
+        rows = c.execute(
+            f"SELECT DISTINCT {col} FROM listings "
+            f"WHERE {col} IS NOT NULL ORDER BY {col}"
+        ).fetchall()
+    return [r[0] for r in rows]
 
-    market = st.radio(
-        "Market",
-        MARKETS_AVAILABLE,
-        format_func=lambda m: MARKET_LABEL.get(m, m.upper()),
-        horizontal=True,
-        key="market",
-        label_visibility="collapsed",
-    )
 
-    conn = sqlite3.connect(db_path(market))
+@st.cache_data(ttl=60)
+def overall_stats(market: str):
+    with sqlite3.connect(db_path(market)) as c:
+        total = c.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+        refs = c.execute("SELECT COUNT(DISTINCT reference) FROM listings").fetchone()[0]
+        min_d, max_d = c.execute(
+            "SELECT MIN(posted_at), MAX(posted_at) FROM listings"
+        ).fetchone()
+    return total, refs, min_d, max_d
 
-    @st.cache_data(ttl=60)
-    def load_distinct(col: str, market: str) -> list[str]:
-        with sqlite3.connect(db_path(market)) as c:
-            rows = c.execute(
-                f"SELECT DISTINCT {col} FROM listings "
-                f"WHERE {col} IS NOT NULL ORDER BY {col}"
-            ).fetchall()
-        return [r[0] for r in rows]
 
-    @st.cache_data(ttl=60)
-    def overall_stats(market: str):
-        with sqlite3.connect(db_path(market)) as c:
-            total = c.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
-            refs = c.execute("SELECT COUNT(DISTINCT reference) FROM listings").fetchone()[0]
-            min_d, max_d = c.execute(
-                "SELECT MIN(posted_at), MAX(posted_at) FROM listings"
-            ).fetchone()
-        return total, refs, min_d, max_d
+def render_market_view(market: str) -> None:
+    """Render the full filter + table UX for one market. Called once per tab.
 
+    Uses market-suffixed widget keys so filter state is independent between
+    tabs — typing '5167' in HK doesn't affect what's shown in the EU tab.
+    """
     total, n_refs, min_d, max_d = overall_stats(market)
     st.caption(
         f"{MARKET_LABEL.get(market, market.upper())} · {total:,} listings · "
         f"{n_refs:,} refs · {min_d[:10]} → {max_d[:10]}"
     )
 
-    # ----- Filters -----
+    # Filters
     top1, top2 = st.columns([2, 1])
     with top1:
         ref = st.text_input(
             "Reference", "", placeholder="e.g. 5167, 26240OR, RM035",
-            label_visibility="collapsed",
+            label_visibility="collapsed", key=f"ref_{market}",
         )
     with top2:
         sort_by = st.selectbox(
             "Sort",
             ["Newest", "Price ↑", "Price ↓", "Year ↓"],
-            label_visibility="collapsed",
+            label_visibility="collapsed", key=f"sort_{market}",
         )
 
     with st.expander("More filters", expanded=False):
         f1, f2 = st.columns(2)
         brands = load_distinct("brand", market)
-        brand = f1.selectbox("Brand", [""] + brands)
-        condition = f2.radio("Condition", ["any", "new", "used"], horizontal=True)
+        brand = f1.selectbox("Brand", [""] + brands, key=f"brand_{market}")
+        condition = f2.radio("Condition", ["any", "new", "used"],
+                             horizontal=True, key=f"cond_{market}")
 
         f3, f4 = st.columns(2)
-        color = f3.text_input("Color", "", placeholder="blue, salmon, ice blue")
-        details = f4.text_input("Details", "", placeholder="diamond, roman, pavé")
+        color = f3.text_input("Color", "", placeholder="blue, salmon, ice blue",
+                              key=f"color_{market}")
+        details = f4.text_input("Details", "", placeholder="diamond, roman, pavé",
+                                key=f"details_{market}")
 
         f5, f6 = st.columns(2)
-        full_set = f5.radio("Full set", ["any", "yes", "no"], horizontal=True)
-        seller = f6.text_input("Seller", "")
+        full_set = f5.radio("Full set", ["any", "yes", "no"],
+                            horizontal=True, key=f"fs_{market}")
+        seller = f6.text_input("Seller", "", key=f"seller_{market}")
 
-        year_min, year_max = st.slider("Year made", 1990, 2030, (2010, 2026))
+        year_min, year_max = st.slider("Year made", 1990, 2030, (2010, 2026),
+                                       key=f"year_{market}")
 
-    # ----- Build SQL -----
+    # Build SQL
     where = ["1=1"]
     params: list = []
     if ref:
@@ -253,71 +246,85 @@ with tab_prices:
     LIMIT 1000
     """
 
-    df = pd.read_sql_query(sql, conn, params=params)
+    with sqlite3.connect(db_path(market)) as conn:
+        df = pd.read_sql_query(sql, conn, params=params)
 
-    if len(df):
-        def _fmt_ref(row):
-            r = row["reference"]
-            n = row["nickname"]
-            return f"{r} ({n})" if isinstance(n, str) and n else r
-
-        df["Ref"] = df.apply(_fmt_ref, axis=1)
-        df["Year"] = df["year_made"].apply(fmt_year)
-        df["N"] = df["month_made"].apply(fmt_month)
-        df["Metal"] = df["metal"].fillna("")
-        df["Dial"] = df.apply(lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1)
-        df["Description"] = df["raw_line"].fillna("")
-        df["Price"] = df.apply(
-            lambda r: fmt_price(r["price_hkd"], r["price_usdt"], r.get("price_eur")),
-            axis=1,
-        )
-
-        hkd = df["price_hkd"].dropna()
-        if len(hkd):
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Matches", f"{len(df):,}")
-            m2.metric("Median", f"{int(hkd.median()/1000):,}k")
-            m3.metric("Low", f"{int(hkd.min()/1000):,}k")
-            m4.metric("High", f"{int(hkd.max()/1000):,}k")
-        else:
-            st.caption(f"{len(df):,} matches · prices in HKD")
-
-        compact = df[["Ref", "Year", "N", "Metal", "Dial", "Description", "Price"]]
-        st.dataframe(
-            compact,
-            width="stretch",
-            hide_index=True,
-            height=min(620, 38 * (len(compact) + 1) + 3),
-            column_config={
-                "Ref": st.column_config.TextColumn(width="small"),
-                "Year": st.column_config.TextColumn(width="small"),
-                "N": st.column_config.TextColumn(width="small", help="Newly-delivered month"),
-                "Metal": st.column_config.TextColumn(width="small",
-                    help="Case metal decoded from Rolex 6th digit"),
-                "Dial": st.column_config.TextColumn(width="medium"),
-                "Description": st.column_config.TextColumn(width="large"),
-                "Price": st.column_config.TextColumn(width="small"),
-            },
-        )
-
-        with st.expander("Show full row (brand, seller, phone, date, raw line)"):
-            df["Date"] = df["posted_at"].str.slice(0, 10)
-            df["Time"] = df["posted_at"].str.slice(11, 16)
-            full = df[[
-                "Date", "Time", "reference", "nickname", "brand", "Year", "N",
-                "metal", "dial_color", "dial_details", "condition", "full_set",
-                "price_hkd", "price_usdt", "price_eur",
-                "seller", "seller_phone", "raw_line",
-            ]]
-            st.dataframe(full, width="stretch", hide_index=True)
-            st.download_button(
-                "Download CSV",
-                full.to_csv(index=False).encode("utf-8"),
-                "filtered_listings.csv",
-                "text/csv",
-            )
-    else:
+    if not len(df):
         st.info("No matches. Try a different reference or open 'More filters' to widen.")
+        return
+
+    def _fmt_ref(row):
+        r = row["reference"]
+        n = row["nickname"]
+        return f"{r} ({n})" if isinstance(n, str) and n else r
+
+    df["Ref"] = df.apply(_fmt_ref, axis=1)
+    df["Year"] = df["year_made"].apply(fmt_year)
+    df["N"] = df["month_made"].apply(fmt_month)
+    df["Metal"] = df["metal"].fillna("")
+    df["Dial"] = df.apply(lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1)
+    df["Description"] = df["raw_line"].fillna("")
+    df["Price"] = df.apply(
+        lambda r: fmt_price(r["price_hkd"], r["price_usdt"], r.get("price_eur")),
+        axis=1,
+    )
+
+    hkd = df["price_hkd"].dropna()
+    if len(hkd):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Matches", f"{len(df):,}")
+        m2.metric("Median", f"{int(hkd.median()/1000):,}k")
+        m3.metric("Low", f"{int(hkd.min()/1000):,}k")
+        m4.metric("High", f"{int(hkd.max()/1000):,}k")
+    else:
+        st.caption(f"{len(df):,} matches · prices in HKD")
+
+    compact = df[["Ref", "Year", "N", "Metal", "Dial", "Description", "Price"]]
+    st.dataframe(
+        compact,
+        width="stretch",
+        hide_index=True,
+        height=min(620, 38 * (len(compact) + 1) + 3),
+        column_config={
+            "Ref": st.column_config.TextColumn(width="small"),
+            "Year": st.column_config.TextColumn(width="small"),
+            "N": st.column_config.TextColumn(width="small", help="Newly-delivered month"),
+            "Metal": st.column_config.TextColumn(width="small",
+                help="Case metal decoded from Rolex 6th digit"),
+            "Dial": st.column_config.TextColumn(width="medium"),
+            "Description": st.column_config.TextColumn(width="large"),
+            "Price": st.column_config.TextColumn(width="small"),
+        },
+    )
+
+    with st.expander("Show full row (brand, seller, phone, date, raw line)"):
+        df["Date"] = df["posted_at"].str.slice(0, 10)
+        df["Time"] = df["posted_at"].str.slice(11, 16)
+        full = df[[
+            "Date", "Time", "reference", "nickname", "brand", "Year", "N",
+            "metal", "dial_color", "dial_details", "condition", "full_set",
+            "price_hkd", "price_usdt", "price_eur",
+            "seller", "seller_phone", "raw_line",
+        ]]
+        st.dataframe(full, width="stretch", hide_index=True)
+        st.download_button(
+            "Download CSV",
+            full.to_csv(index=False).encode("utf-8"),
+            f"listings_{market}.csv",
+            "text/csv",
+            key=f"dl_{market}",
+        )
+
+
+# ----- Top-level tabs: one per market + Compare -----
+tab_titles = [MARKET_LABEL[m] for m in MARKETS_AVAILABLE] + ["🔀 Compare"]
+tabs = st.tabs(tab_titles)
+
+for i, m in enumerate(MARKETS_AVAILABLE):
+    with tabs[i]:
+        render_market_view(m)
+
+tab_compare = tabs[-1]
 
 # ==========================================================================
 # TAB 2 — Compare markets (same watch across HK / EU / Europe in USD)
