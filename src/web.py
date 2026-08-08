@@ -48,14 +48,14 @@ st.markdown(
 )
 
 # ----- Market discovery -----
-MARKETS_AVAILABLE = [m for m in ("hk", "eu", "europe") if db_path(m).exists()]
+MARKETS_AVAILABLE = [m for m in ("hk", "eu", "wdg") if db_path(m).exists()]
 if not MARKETS_AVAILABLE:
     st.error("No databases found. Run `python src/refresh.py` first.")
     st.stop()
 
-MARKET_LABEL = {"hk": "🇭🇰 HK", "eu": "🇪🇺 EU (Reuven)", "europe": "🇪🇺 Europe"}
+MARKET_LABEL = {"hk": "🇭🇰 HK", "eu": "🇪🇺 EU (Reuven)", "wdg": "🇪🇺 WDG"}
 # Short code used in Compare-tab column headers ("HK n", "EU min $", ...)
-MARKET_SHORT = {"hk": "HK", "eu": "EU", "europe": "EUROPE"}
+MARKET_SHORT = {"hk": "HK", "eu": "EU", "wdg": "WDG"}
 
 
 # ----- Currency conversion (fixed rates; approximate) -----

@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-MARKETS = ("hk", "eu", "europe")
+MARKETS = ("hk", "eu", "wdg")
 
 
 def db_path(market: str) -> Path:
@@ -21,9 +21,11 @@ def db_path(market: str) -> Path:
         # deployment doesn't need a file move.
         return ROOT / "data" / "watches.db"
     if market == "eu":
+        # Reuven Trade Professional group.
         return ROOT / "data" / "watches_eu.db"
-    if market == "europe":
-        return ROOT / "data" / "watches_europe.db"
+    if market == "wdg":
+        # WDG group (extracted via the WhatsApp Web scraper).
+        return ROOT / "data" / "watches_wdg.db"
     raise ValueError(f"Unknown market {market!r}. Valid: {MARKETS}")
 
 
@@ -33,6 +35,6 @@ def exports_dir(market: str) -> Path:
         return ROOT / "exports"
     if market == "eu":
         return ROOT / "exports" / "eu"
-    if market == "europe":
-        return ROOT / "exports" / "europe"
+    if market == "wdg":
+        return ROOT / "exports" / "wdg"
     raise ValueError(f"Unknown market {market!r}. Valid: {MARKETS}")

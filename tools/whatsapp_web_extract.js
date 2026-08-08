@@ -9,8 +9,8 @@
      5. Paste this entire file, press Enter.
      6. Wait. Progress lines appear like "… 1,234 messages so far".
      7. When it finishes, `whatsapp_chat_YYYY-MM-DD.txt` downloads.
-     8. Move it to  exports/europe/YYYY-MM-DD_export.txt  and run
-             python3 src/refresh.py --market europe
+     8. Move it to  exports/wdg/YYYY-MM-DD_export.txt  and run
+             python3 src/refresh.py --market wdg
    ========================================================================== */
 
 (async () => {

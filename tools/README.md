@@ -25,14 +25,14 @@ the same parser handles it.
 
    ```bash
    mv ~/Downloads/whatsapp_chat_2026-08-10.txt \
-      ~/Projects/hk-watch-prices/exports/europe/2026-08-10_export.txt
+      ~/Projects/hk-watch-prices/exports/wdg/2026-08-10_export.txt
    ```
 
 8. Run the refresh:
 
    ```bash
    cd ~/Projects/hk-watch-prices
-   python3 src/refresh.py --market europe
+   python3 src/refresh.py --market wdg
    ```
 
 Same dedup / vacuum happens automatically; the Streamlit UI's Market
