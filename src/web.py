@@ -59,7 +59,7 @@ if "market" not in st.session_state:
 
 cols_title = st.columns([2, 3])
 cols_title[0].title("Watch Prices")
-market_label = {"hk": "🇭🇰 HK", "eu": "🇪🇺 EU"}
+market_label = {"hk": "🇭🇰 HK", "eu": "🇪🇺 EU (Reuven)", "europe": "🇪🇺 Europe"}
 market = cols_title[1].radio(
     "Market",
     MARKETS_AVAILABLE,

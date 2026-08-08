@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-MARKETS = ("hk", "eu")
+MARKETS = ("hk", "eu", "europe")
 
 
 def db_path(market: str) -> Path:
@@ -22,6 +22,8 @@ def db_path(market: str) -> Path:
         return ROOT / "data" / "watches.db"
     if market == "eu":
         return ROOT / "data" / "watches_eu.db"
+    if market == "europe":
+        return ROOT / "data" / "watches_europe.db"
     raise ValueError(f"Unknown market {market!r}. Valid: {MARKETS}")
 
 
@@ -31,4 +33,6 @@ def exports_dir(market: str) -> Path:
         return ROOT / "exports"
     if market == "eu":
         return ROOT / "exports" / "eu"
+    if market == "europe":
+        return ROOT / "exports" / "europe"
     raise ValueError(f"Unknown market {market!r}. Valid: {MARKETS}")
