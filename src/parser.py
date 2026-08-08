@@ -332,7 +332,7 @@ def _extract_eur(line: str) -> int | None:
         re.compile(r"€\s*(\d+(?:\.\d+)?)\s*([kKmM]|mil)\b"),
         re.compile(r"(\d+(?:\.\d+)?)\s*([kKmM]|mil)\s*€"),
         re.compile(r"EUR\s*(\d+(?:\.\d+)?)\s*([kKmM]|mil)\b", re.I),
-        re.compile(r"(\d+(?:\.\d+)?)\s*([kKmM]|mil)\s*EUR\b", re.I),
+        re.compile(r"(\d+(?:\.\d+)?)\s*([kKmM]|mil)\s*(?:EUR|EURO|EUROS)\b", re.I),
     ]:
         m = pat.search(line)
         if m:
@@ -351,8 +351,8 @@ def _extract_eur(line: str) -> int | None:
         re.compile(r"€\s*(\d{1,3}(?:[\.,\'’ \s]\d{3})+)"),
         re.compile(r"(\d{4,7})\s*€"),
         re.compile(r"€\s*(\d{4,7})"),
-        re.compile(r"\bEUR\s*:?\s*(\d[\d\.,\'’ \s]*)", re.I),
-        re.compile(r"(\d[\d\.,\'’ \s]*)\s*EUR\b", re.I),
+        re.compile(r"\b(?:EUR|EURO|EUROS)\s*:?\s*(\d[\d\.,\'’ \s]*)", re.I),
+        re.compile(r"(\d[\d\.,\'’ \s]*)\s*(?:EUR|EURO|EUROS)\b", re.I),
     ]
     for pat in pats:
         for m in pat.finditer(line):
@@ -927,13 +927,52 @@ def parse_export(path: Path) -> ParseResult:
         first_line_lo = body.strip().splitlines()[0].lower() if body.strip() else ""
         if any(kw in first_line_lo for kw in ("looking for", "wtb", "[wtb]", "looking")):
             continue
-        # First pass: line-by-line parsing
-        # Second pass: pair "ref line" + "price line" when split across two lines.
+        # ---- Whole-message pre-pass ----
+        # WhatsApp Web-scraped messages (WDG format) put the ref and price
+        # on separate lines with blank lines and junk (SKU, URL, "104 Ko")
+        # in between. If the whole message body contains EXACTLY one
+        # meaningful reference and one price, treat it as a single listing.
+        # Dense multi-listing dealer messages (HK stock lists) skip this
+        # and fall through to line-by-line parsing.
+        def _is_junk(ln: str) -> bool:
+            """Skip WhatsApp Web scrape artifacts that would otherwise
+            confuse reference/price extraction."""
+            s = ln.strip()
+            if not s:
+                return True
+            if re.match(r"^\d{1,3}\s?Ko\s*$", s):        # "104 Ko" file size
+                return True
+            if re.match(r"^SKU\s*:", s, re.I):           # "SKU: 16341"
+                return True
+            if s.startswith("http"):                     # URL (may embed fake refs)
+                return True
+            if re.match(r"^\d{1,2}:\d{2}\s*$", s):       # dangling send-time
+                return True
+            return False
+
+        keep_lines = [ln.strip() for ln in body.splitlines() if not _is_junk(ln)]
+
+        # Count unique refs in the cleaned body only
+        all_refs = set()
+        for ln in keep_lines:
+            r = extract_reference(ln)
+            if r:
+                all_refs.add(r.upper())
+        if len(all_refs) == 1:
+            combined = " ".join(keep_lines)
+            listing = parse_line(combined, posted_at, seller or "", body, source_file)
+            if listing:
+                listing.raw_line = combined
+                result.listings.append(listing)
+                continue
+
+        # ---- Line-by-line pass (dense dealer stock lists) ----
         lines = [ln.strip() for ln in body.splitlines()]
         pending_ref_line: str | None = None  # a line that has a ref but no price
         for line in lines:
             if not line:
-                pending_ref_line = None
+                # NOTE: don't reset pending — blank lines inside a single
+                # message body are common in WhatsApp Web scrapes.
                 continue
             listing = parse_line(line, posted_at, seller or "", body, source_file)
             if listing:
