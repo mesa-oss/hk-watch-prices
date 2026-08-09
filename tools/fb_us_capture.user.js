@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      3.3
+// @version      3.4
 // @description  Intercepts Facebook's GraphQL responses via unsafeWindow (bypasses TM sandbox AND FB's CSP). No inline injection, no DOM parsing.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -31,7 +31,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] v3.3 (unsafeWindow hook) starting");
+  console.log("[US Moda] v3.4 (unsafeWindow hook + response diagnostics) starting");
   const SERVER = "http://127.0.0.1:8766";
 
   // Fall back to window if unsafeWindow isn't granted (shouldn't happen with our header)
@@ -189,16 +189,37 @@
     }
   };
 
-  const parseBody = (body) => {
-    if (!body || typeof body !== "string") return;
+  let parseCount = 0;
+  const parseBody = (body, sourceUrl) => {
+    parseCount++;
+    if (!body || typeof body !== "string") {
+      if (parseCount <= 3) console.log(`[US Moda] parseBody #${parseCount}: empty/non-string body from ${sourceUrl}`);
+      return;
+    }
     if (body.startsWith("for (;;);")) body = body.slice(9);
     if (body.startsWith(")]}'")) body = body.slice(4);
+
+    let extractedThisResponse = 0;
+    const before = extractedPosts;
     for (const line of body.split("\n")) {
       const t = line.trim();
       if (!t.startsWith("{")) continue;
       try { walkForPosts(JSON.parse(t)); } catch (_) {}
     }
     try { walkForPosts(JSON.parse(body)); } catch (_) {}
+    extractedThisResponse = extractedPosts - before;
+
+    // For the first few responses, dump a preview so we can see the shape
+    if (parseCount <= 5 || extractedThisResponse > 0) {
+      const short = (sourceUrl || "").split("?")[0].slice(0, 60);
+      console.log(
+        `[US Moda] parseBody #${parseCount} ${short} bodyLen=${body.length} extracted=${extractedThisResponse}`
+      );
+      if (parseCount <= 3 && body.length > 100) {
+        // Print first 400 chars of body so we can see the structure
+        console.log(`[US Moda] body preview:`, body.slice(0, 400));
+      }
+    }
   };
 
   const shouldIntercept = (url) => {
@@ -243,7 +264,7 @@
         interceptedRequests++;
         updateBadge();
         p.then((resp) => {
-          resp.clone().text().then(parseBody).catch(() => {});
+          resp.clone().text().then((body) => parseBody(body, url)).catch(() => {});
         }).catch(() => {});
       }
       return p;
@@ -259,8 +280,10 @@
     function PatchedXHR() {
       const xhr = new OrigXHR();
       let intercept = false;
+      let capturedUrl = "";
       const origOpen = xhr.open;
       xhr.open = function (method, url) {
+        capturedUrl = url;
         noteUrl("XHR", url);
         intercept = shouldIntercept(url);
         if (intercept) {
@@ -270,9 +293,18 @@
         return origOpen.apply(xhr, arguments);
       };
       xhr.addEventListener("load", () => {
-        if (intercept) {
-          try { parseBody(xhr.responseText); } catch (_) {}
+        if (!intercept) return;
+        // Try responseText first; if responseType is 'json' or 'arraybuffer',
+        // responseText throws — fall back to xhr.response.
+        let body = null;
+        try { body = xhr.responseText; }
+        catch (_) {
+          try {
+            const r = xhr.response;
+            body = (typeof r === "string") ? r : JSON.stringify(r);
+          } catch (_) {}
         }
+        parseBody(body, capturedUrl);
       });
       return xhr;
     }
