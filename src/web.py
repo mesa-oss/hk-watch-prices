@@ -897,7 +897,7 @@ def render_top_deals() -> None:
     merged["Dial"] = merged.apply(
         lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1,
     )
-    merged["Src"] = merged["source"].map({m: MARKET_SHORT[m] for m in eu_sources})
+    merged["Src"] = merged["source"].map({m: MARKET_SHORT[m] for m in buy_sources})
     merged["EU $"] = merged["buy_usd"].apply(fmt_usd)
     # HK-side year + N surfaced so the user can verify the sig match at a
     # glance. Same-sig rows must have matching year and month — if these
