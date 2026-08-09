@@ -22,8 +22,15 @@ MESSAGE_HEADER = re.compile(
 )
 
 WTB_KEYWORDS = (
-    "looking for", "looking", "wtb", "want to buy", "需要", "wanted",
-    "need ", "search for", "searching", "best offer",
+    "looking for", "looking to buy", "looking", "wtb", "[wtb]",
+    "want to buy", "want to purchase", "would like to buy",
+    "wanted", "in search of", "iso ", "chasing", "requesting",
+    "anyone selling", "anyone has", "anyone got",
+    "who has", "who is selling", "who's got",
+    "need ",  # trailing space avoids "needs a polish"
+    "search for", "searching", "best offer",
+    "需要",              # Chinese
+    "recherche", "cerco", "busco", "suche",   # FR, IT, ES, DE
 )
 
 SYSTEM_HINTS = (
@@ -997,6 +1004,13 @@ def parse_export(path: Path) -> ParseResult:
                 all_refs.add(r.upper())
         if len(all_refs) == 1:
             combined = " ".join(keep_lines)
+            # WTB check on the FULL body — the first-line filter above only
+            # catches messages starting with the keyword. Some WTB posts have
+            # a photo caption / greeting first and the "wtb"/"looking" further
+            # down.
+            combined_lo = combined.lower()
+            if any(kw in combined_lo for kw in WTB_KEYWORDS):
+                continue
             listing = parse_line(combined, posted_at, seller or "", body, source_file)
             if listing:
                 listing.raw_line = combined
