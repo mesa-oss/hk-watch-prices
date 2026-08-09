@@ -369,9 +369,9 @@ def _extract_eur(line: str) -> int | None:
         re.compile(r"EUR\s*(\d{1,2}\.\d{1,3})\b(?!\s*[kKmM])", re.I),
         re.compile(r"(\d{1,2}\.\d{1,3})\s*(?:EUR|EURO|EUROS)\b(?!\s*[kKmM])", re.I),
         re.compile(r"€\s*(\d{1,2})(?![\d.,kKmM])"),
-        re.compile(r"(\d{1,2})\s*€(?![kKmM])"),
+        re.compile(r"(?<!\d)(\d{1,2})\s*€(?![kKmM])"),
         re.compile(r"EUR\s+(\d{1,2})\b(?![\d.,kKmM])", re.I),
-        re.compile(r"(\d{1,2})\s+(?:EUR|EURO|EUROS)\b(?![kKmM])", re.I),
+        re.compile(r"(?<!\d)(\d{1,2})\s+(?:EUR|EURO|EUROS)\b(?![kKmM])", re.I),
         # Comma-as-decimal (EU convention): €24,5 = 24,500. Restricted
         # to 1-2 digits after the comma so we don't collide with the
         # English thousands separator handled by the existing patterns.
@@ -404,6 +404,10 @@ def _extract_eur(line: str) -> int | None:
             if not digits or len(digits) < 3:
                 continue
             amt = int(digits)
+            # Reject values that look like a year (1900-2039) — those are
+            # almost always a mismatched capture from a listing's model year.
+            if 1900 <= amt <= 2039:
+                continue
             if 500 <= amt <= 20_000_000:
                 return amt
     return None
