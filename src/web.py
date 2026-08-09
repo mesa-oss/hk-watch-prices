@@ -52,16 +52,19 @@ st.markdown(
 # primary EU source. DB stays on disk — remove this override to re-enable.
 _HIDDEN_MARKETS = {"eu"}
 MARKETS_AVAILABLE = [
-    m for m in ("hk", "eu", "wdg")
+    m for m in ("hk", "eu", "wdg", "usmoda")
     if db_path(m).exists() and m not in _HIDDEN_MARKETS
 ]
 if not MARKETS_AVAILABLE:
     st.error("No databases found. Run `python src/refresh.py` first.")
     st.stop()
 
-MARKET_LABEL = {"hk": "🇭🇰 HK", "eu": "🇪🇺 EU (Reuven)", "wdg": "🇪🇺 WDG"}
+MARKET_LABEL = {
+    "hk": "🇭🇰 HK", "eu": "🇪🇺 EU (Reuven)", "wdg": "🇪🇺 WDG",
+    "usmoda": "🇺🇸 US Moda",
+}
 # Short code used in Compare-tab column headers ("HK n", "EU min $", ...)
-MARKET_SHORT = {"hk": "HK", "eu": "EU", "wdg": "WDG"}
+MARKET_SHORT = {"hk": "HK", "eu": "EU", "wdg": "WDG", "usmoda": "US"}
 
 
 # ----- Currency conversion (fixed rates; approximate) -----

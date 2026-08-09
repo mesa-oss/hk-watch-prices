@@ -23,15 +23,16 @@ from db import (
     connect, insert_listings, mark_export_loaded, is_export_loaded,
     dedup_repeated_listings, vacuum, stats,
 )
-from paths import db_path, exports_dir, MARKETS
+from paths import db_path, exports_dir, MARKETS, USD_MARKETS
 
 
-def load_export(conn, path: Path, *, force: bool, use_llm: bool) -> int:
+def load_export(conn, path: Path, *, force: bool, use_llm: bool,
+                dollar_is_usd: bool = False) -> int:
     if not force and is_export_loaded(conn, path.name):
         print(f"  · {path.name}: already loaded (use --force to reparse)")
         return 0
 
-    result = parse_export(path)
+    result = parse_export(path, dollar_is_usd=dollar_is_usd)
     print(f"  · {path.name}: parsed {len(result.listings)} listings, "
           f"{len(result.unparsed)} unparsed candidates")
 
@@ -73,12 +74,14 @@ def main():
             print(f"No .txt files found in {exports}")
             sys.exit(1)
 
+    dollar_is_usd = args.market in USD_MARKETS
     print(f"Market:   {args.market.upper()}")
     print(f"Database: {db_file}")
-    print(f"Loading {len(files)} file(s)...")
+    print(f"Loading {len(files)} file(s)... ($ = {'USD' if dollar_is_usd else 'HKD'})")
     total = 0
     for f in files:
-        total += load_export(conn, f, force=args.force, use_llm=args.llm)
+        total += load_export(conn, f, force=args.force, use_llm=args.llm,
+                             dollar_is_usd=dollar_is_usd)
 
     print()
     print(f"Done. Inserted {total} new rows total.")

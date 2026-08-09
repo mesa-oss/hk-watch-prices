@@ -174,7 +174,9 @@ def infer_brand(reference: str, message_context: str = "") -> str | None:
         return "IWC"
     if ref.startswith("PAM"):
         return "Panerai"
-    if ref.startswith("W") and re.match(r"^W[A-Z]{2,3}\d{4,5}$", ref):
+    # Cartier W-prefix: W2020033, W4PN0016 (digit-in-middle), WSPN0013,
+    # WGSA0031, WJTA0037. Broader than the strict letters-only variant.
+    if re.match(r"^W[A-Z0-9]{2,3}\d{3,5}$", ref):
         return "Cartier"
     if re.match(r"^\d{3}\.\d{3}$", ref):
         return "A. Lange & Söhne"
@@ -413,13 +415,19 @@ def _extract_eur(line: str) -> int | None:
     return None
 
 
-def extract_price(line: str) -> tuple[int | None, int | None, int | None, str]:
+def extract_price(line: str, *, dollar_is_usd: bool = False) -> tuple[int | None, int | None, int | None, str]:
     """Extract price and return (hkd, usdt, eur, matched_chunk).
 
+    Currency routing:
+      - Explicit 'HKD' keyword → price_hkd
+      - Explicit 'USDT' keyword → price_usdt
+      - '€' / 'EUR' → price_eur (handled in _extract_eur)
+      - '$' → depends on `dollar_is_usd`:
+          False (default, HK convention): '$' means HKD
+          True  (US markets):             '$' means USD, stored in price_usdt
+
     HKD and USDT use the '1.82m'-as-decimal convention (Asian dealer style).
-    EUR uses European thousands-separator convention — handled in
-    _extract_eur() to avoid conflating '12.500€' (12,500 EUR) with '12.500m'
-    (12.5 million).
+    EUR uses European thousands-separator convention (see _extract_eur).
     """
     eur = _extract_eur(line)
     # Greedy: look for explicit HKD/USDT/$ markers first
@@ -458,9 +466,13 @@ def extract_price(line: str) -> tuple[int | None, int | None, int | None, str]:
                 # Bare number under 1000 is probably not a price unless followed by k/m
                 continue
             pat_src = pat.pattern.lower()
-            # In HK dealer lists "$" means HKD, not USD/USDT. Only the
-            # explicit USDT keyword represents the crypto stablecoin price.
-            if "usdt" in pat_src:
+            is_usdt_pat = "usdt" in pat_src
+            is_dollar_pat = pat_src.startswith(r"\$")
+            # In HK dealer lists "$" means HKD (dollar_is_usd=False, default).
+            # In US markets "$" means USD, which we store in price_usdt
+            # (USDT ≈ USD for FX purposes, and adding a fourth column just for
+            # US is heavier than it's worth right now).
+            if is_usdt_pat or (is_dollar_pat and dollar_is_usd):
                 if usdt is None:
                     usdt = int(amt)
             else:
@@ -860,7 +872,7 @@ def extract_seller_phone(seller: str | None) -> str | None:
     return None
 
 
-def parse_line(line: str, posted_at: str, seller: str, message_context: str, source_file: str) -> Listing | None:
+def parse_line(line: str, posted_at: str, seller: str, message_context: str, source_file: str, *, dollar_is_usd: bool = False) -> Listing | None:
     # Strip WhatsApp strikethrough (~text~) and HK$ → HKD
     line = line.replace("~", "").replace("HK$", "HKD ")
     if not is_listing_line(line):
@@ -872,7 +884,7 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
     # bare-number fallback can't mistake the ref for a price. Fixes cases
     # like 'Rolex 124060' where 124060 was captured as HKD 124,060.
     line_for_price = re.sub(re.escape(ref), " " * len(ref), line, flags=re.IGNORECASE)
-    hkd, usdt, eur, _ = extract_price(line_for_price)
+    hkd, usdt, eur, _ = extract_price(line_for_price, dollar_is_usd=dollar_is_usd)
     if hkd is None and usdt is None and eur is None:
         return None
     condition, full_set = extract_condition(line)
@@ -967,7 +979,7 @@ class ParseResult:
         )
 
 
-def parse_export(path: Path) -> ParseResult:
+def parse_export(path: Path, *, dollar_is_usd: bool = False) -> ParseResult:
     text = path.read_text(encoding="utf-8")
     result = ParseResult()
     source_file = path.name
@@ -1021,7 +1033,7 @@ def parse_export(path: Path) -> ParseResult:
             combined_lo = combined.lower()
             if any(kw in combined_lo for kw in WTB_KEYWORDS):
                 continue
-            listing = parse_line(combined, posted_at, seller or "", body, source_file)
+            listing = parse_line(combined, posted_at, seller or "", body, source_file, dollar_is_usd=dollar_is_usd)
             if listing:
                 listing.raw_line = combined
                 result.listings.append(listing)
@@ -1035,7 +1047,7 @@ def parse_export(path: Path) -> ParseResult:
                 # NOTE: don't reset pending — blank lines inside a single
                 # message body are common in WhatsApp Web scrapes.
                 continue
-            listing = parse_line(line, posted_at, seller or "", body, source_file)
+            listing = parse_line(line, posted_at, seller or "", body, source_file, dollar_is_usd=dollar_is_usd)
             if listing:
                 result.listings.append(listing)
                 pending_ref_line = None
@@ -1043,7 +1055,7 @@ def parse_export(path: Path) -> ParseResult:
 
             # Maybe this is a ref-only line (no price) — remember for pairing
             ref = extract_reference(line)
-            hkd, usdt, eur, _ = extract_price(line)
+            hkd, usdt, eur, _ = extract_price(line, dollar_is_usd=dollar_is_usd)
             has_price_marker = bool(
                 re.search(r"(?:hkd|usdt|usd|eur|💰|€)", line, re.I) or "$" in line
             )
@@ -1055,7 +1067,7 @@ def parse_export(path: Path) -> ParseResult:
             # Maybe this is a price-only line and we have a pending ref above
             if pending_ref_line and (hkd or usdt or eur or has_price_marker) and not ref:
                 combined = f"{pending_ref_line} {line}"
-                listing = parse_line(combined, posted_at, seller or "", body, source_file)
+                listing = parse_line(combined, posted_at, seller or "", body, source_file, dollar_is_usd=dollar_is_usd)
                 if listing:
                     listing.raw_line = combined
                     result.listings.append(listing)

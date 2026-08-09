@@ -11,21 +11,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-MARKETS = ("hk", "eu", "wdg")
+MARKETS = ("hk", "eu", "wdg", "usmoda")
+
+# Markets whose native currency is USD (they use $ = USD, not HKD).
+# The parser routes '$' and bare 'k'/'m' amounts to price_usdt (USD-equivalent)
+# for these markets instead of the default HKD.
+USD_MARKETS = {"usmoda"}
 
 
 def db_path(market: str) -> Path:
     market = market.lower()
     if market == "hk":
-        # Original file — kept at data/watches.db so existing Streamlit
-        # deployment doesn't need a file move.
         return ROOT / "data" / "watches.db"
     if market == "eu":
-        # Reuven Trade Professional group.
         return ROOT / "data" / "watches_eu.db"
     if market == "wdg":
-        # WDG group (extracted via the WhatsApp Web scraper).
         return ROOT / "data" / "watches_wdg.db"
+    if market == "usmoda":
+        return ROOT / "data" / "watches_usmoda.db"
     raise ValueError(f"Unknown market {market!r}. Valid: {MARKETS}")
 
 
@@ -37,4 +40,6 @@ def exports_dir(market: str) -> Path:
         return ROOT / "exports" / "eu"
     if market == "wdg":
         return ROOT / "exports" / "wdg"
+    if market == "usmoda":
+        return ROOT / "exports" / "usmoda"
     raise ValueError(f"Unknown market {market!r}. Valid: {MARKETS}")
