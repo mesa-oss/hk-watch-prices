@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      3.1
+// @version      3.2
 // @description  Intercepts Facebook's GraphQL responses to capture Watchtrading posts. Injects hook code into the page's real context (bypasses Tampermonkey sandbox) and forwards captured posts to the local receiver.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -33,7 +33,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] v3.1 (page-context inject) starting");
+  console.log("[US Moda] v3.2 (page-context inject + URL diagnostics) starting");
   const SERVER = "http://127.0.0.1:8766";
 
   // ---------- The injected hook code ----------
@@ -53,8 +53,26 @@
         url.includes("/graphql/") ||
         url.includes("bulk-route-definitions") ||
         url.includes("/comet/") ||
-        url.includes("/ajax/route-definitions")
+        url.includes("/ajax/route-definitions") ||
+        url.includes("/ajax/pagelet") ||
+        url.includes("/ajax/bootloader") ||
+        url.includes("/api/graphqlbatch")
       );
+    };
+
+    // TEMP DIAGNOSTIC: log every fetch/XHR URL so we can see what FB
+    // actually calls. Remove once we've confirmed the pattern is right.
+    // Buffered so we don't spam the console — logs a batch every 3s.
+    const urlLog = [];
+    const noteUrl = (kind, url) => {
+      if (!url) return;
+      urlLog.push(`${kind} ${url.slice(0, 200)}`);
+      if (urlLog.length === 1) {
+        setTimeout(() => {
+          console.log("[US Moda inject] URLs seen (last 3s):\n" + urlLog.join("\n"));
+          urlLog.length = 0;
+        }, 3000);
+      }
     };
 
     const seenIds = new Set();
@@ -148,6 +166,7 @@
         typeof input === "string" ? input :
         (input && input.url) ? input.url : "";
       const p = origFetch.apply(this, arguments);
+      noteUrl("FETCH", url);
       if (shouldIntercept(url)) {
         interceptedCount++;
         send({ type: "req", url: url.slice(0, 100), count: interceptedCount });
@@ -165,6 +184,7 @@
       let intercept = false;
       const origOpen = xhr.open;
       xhr.open = function (method, url) {
+        noteUrl("XHR", url);
         intercept = shouldIntercept(url);
         if (intercept) {
           interceptedCount++;
