@@ -274,6 +274,9 @@ def render_market_view(market: str) -> None:
         lambda r: fmt_price(r["price_hkd"], r["price_usdt"], r.get("price_eur")),
         axis=1,
     )
+    # Compact posted timestamp: 'MM-DD HH:MM' — enough to see freshness at a
+    # glance without eating column width. Full ISO is still in the expander.
+    df["Posted"] = df["posted_at"].str.slice(5, 16).str.replace("T", " ")
 
     hkd = df["price_hkd"].dropna()
     if len(hkd):
@@ -285,13 +288,15 @@ def render_market_view(market: str) -> None:
     else:
         st.caption(f"{len(df):,} matches · prices in HKD")
 
-    compact = df[["Ref", "Year", "N", "Metal", "Dial", "Description", "Price"]]
+    compact = df[["Posted", "Ref", "Year", "N", "Metal", "Dial", "Description", "Price"]]
     st.dataframe(
         compact,
         width="stretch",
         hide_index=True,
         height=min(620, 38 * (len(compact) + 1) + 3),
         column_config={
+            "Posted": st.column_config.TextColumn(width="small",
+                help="When the listing was posted (MM-DD HH:MM)"),
             "Ref": st.column_config.TextColumn(width="small"),
             "Year": st.column_config.TextColumn(width="small"),
             "N": st.column_config.TextColumn(width="small", help="Newly-delivered month"),
@@ -889,10 +894,12 @@ def render_top_deals() -> None:
     merged["HK n"] = merged["hk_n"]
     merged["Delta $"] = merged["delta_usd"].apply(fmt_usd)
     merged["Delta %"] = merged["delta_pct"].apply(lambda x: f"+{x:.1f}%")
-    merged["EU date"] = merged["posted_at"].str.slice(0, 10)
+    # Include TIME (not just date) so freshness of live-captured WDG deals
+    # is immediately visible. Format: 'MM-DD HH:MM'.
+    merged["EU posted"] = merged["posted_at"].str.slice(5, 16).str.replace("T", " ")
     merged["EU seller"] = merged["seller"].fillna("")
     merged["EU phone"] = merged["seller_phone"].fillna("")
-    merged["HK date"] = merged["hk_posted"].str.slice(0, 10)
+    merged["HK posted"] = merged["hk_posted"].str.slice(5, 16).str.replace("T", " ")
     merged["HK seller"] = merged["hk_seller"].fillna("")
     merged["HK phone"] = merged["hk_phone"].fillna("")
     merged["EU raw"] = merged["raw_line"].fillna("")
@@ -909,8 +916,8 @@ def render_top_deals() -> None:
         "Src", "Ref", "Year", "N", "Cond", "Metal", "Dial",
         "EU $", "HK Year", "HK N", "HK min $", "HK n",
         "Delta $", "Delta %",
-        "EU date", "EU seller", "EU phone",
-        "HK date", "HK seller", "HK phone",
+        "EU posted", "EU seller", "EU phone",
+        "HK posted", "HK seller", "HK phone",
         "EU raw", "HK raw",
     ]]
 
@@ -937,10 +944,10 @@ def render_top_deals() -> None:
             "HK n": st.column_config.NumberColumn(width="small"),
             "Delta $": st.column_config.TextColumn(width="small"),
             "Delta %": st.column_config.TextColumn(width="small"),
-            "EU date": st.column_config.TextColumn(width="small"),
+            "EU posted": st.column_config.TextColumn(width="small"),
             "EU seller": st.column_config.TextColumn(width="medium"),
             "EU phone": st.column_config.TextColumn(width="medium"),
-            "HK date": st.column_config.TextColumn(width="small"),
+            "HK posted": st.column_config.TextColumn(width="small"),
             "HK seller": st.column_config.TextColumn(width="medium"),
             "HK phone": st.column_config.TextColumn(width="medium"),
             "EU raw": st.column_config.TextColumn(width="large"),

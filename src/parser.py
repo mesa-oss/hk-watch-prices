@@ -444,6 +444,12 @@ def extract_price(line: str) -> tuple[int | None, int | None, int | None, str]:
             except ValueError:
                 continue
             suf = (m.group(2) or "").lower()
+            # Reject year-shape values BEFORE any multiplier — a bare
+            # number in 1900-2039 with no k/m suffix is almost certainly
+            # a model year that got adjacent to a currency keyword
+            # (e.g. '5470P n6/2026 HKD $3.1m' — parser grabbed '2026 HKD').
+            if 1900 <= amt <= 2039 and not suf:
+                continue
             if suf == "k":
                 amt *= 1_000
             elif suf in ("m", "mil"):
