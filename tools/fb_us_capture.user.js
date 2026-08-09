@@ -178,22 +178,55 @@
   const two = (n) => String(n).padStart(2, "0");
   const captured = new WeakSet();  // avoid double-processing same author-link
 
+  // Skip these "authors" — either FB itself, generic system pages, or noise.
+  const AUTHOR_BLOCKLIST = new Set([
+    "facebook", "facebook groups", "meta", "instagram", "admin",
+    "moderator", "group admin", "anonymous participant",
+  ]);
+
+  // A post is worth capturing only if it has REAL trading content.
+  // Comments like "beautiful watch, glws" or "still available?" don't.
+  const looksLikeListing = (text) => {
+    if (text.length < 60) return false;   // comments are usually short
+    // Must contain a price signal OR a plausible ref-number pattern
+    const hasPrice = /\$\s?\d|\€\s?\d|\d\s?(?:usd|eur|hkd|k\b)/i.test(text);
+    const hasRef = /\b(?:1[12]\d{4}|2[67]\d{4}|5\d{3}[A-Z]|W[A-Z0-9]{6})\b/.test(text);
+    const hasBrand = /\b(?:Rolex|Patek|Audemars|Cartier|Hublot|Omega|Tudor|Panerai|Vacheron|Richard\s?Mille|AP|VC|RM|PP)\b/i.test(text);
+    return (hasPrice || hasRef) && hasBrand;
+  };
+
+  // Is this author link inside a comments section? Walk up looking for
+  // comment-container markers.
+  const isInsideComments = (el) => {
+    let node = el;
+    for (let i = 0; i < 15 && node && node !== document.body; i++) {
+      const aria = (node.getAttribute("aria-label") || "").toLowerCase();
+      if (aria.includes("comment")) return true;
+      if (node.tagName === "UL") return true;   // FB renders comments as list items
+      node = node.parentElement;
+    }
+    return false;
+  };
+
   const captureFrom = (root) => {
-    // Query author links inside the given root (or the document if root is null)
     const authors = (root || document).querySelectorAll(AUTHOR_LINK_SEL);
     authors.forEach((authorLink) => {
       if (captured.has(authorLink)) return;
       captured.add(authorLink);
 
+      // Skip comment authors
+      if (isInsideComments(authorLink)) return;
+
       const author = cleanText(authorLink.textContent).slice(0, 100);
       if (!author) return;
+      if (AUTHOR_BLOCKLIST.has(author.toLowerCase())) return;
 
       const container = findPostContainer(authorLink);
       if (!container) return;
 
       const rawText = container.innerText || "";
       const text = cleanText(rawText).slice(0, 3000);
-      if (text.length < 20) return;  // probably a comment stub or empty header
+      if (!looksLikeListing(text)) return;
 
       const ts = extractTimestamp(container);
       const date = `${two(ts.getDate())}/${two(ts.getMonth() + 1)}/${ts.getFullYear()}`;
