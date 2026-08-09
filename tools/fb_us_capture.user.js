@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      1.0
-// @description  Streams new posts from the US Moda Facebook group to the local receiver. Auto-clicks 'new posts' buttons and reloads the page periodically to work around FB's non-push feed.
+// @version      2.0
+// @description  Live-captures posts from a Facebook group and POSTs to the local receiver. v2 uses author-profile-link detection since FB stopped using role='article' for posts, and strips invisible-character anti-bot obfuscation.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
 // @match        https://m.facebook.com/groups/*
@@ -14,30 +14,14 @@
 // ==/UserScript==
 
 /*
-   HOW TO INSTALL
-   --------------
-   1. Install Tampermonkey (already done if the WDG script works).
-   2. Tampermonkey icon → 'Create a new script…' → paste this whole file →
-      save (⌘S).
-   3. Make sure the US receiver is running on your Mac:
-        cd ~/Projects/hk-watch-prices
-        python3 tools/live_receiver.py --market usmoda --port 8766 --refresh-min 5
-      (Different port from WDG — 8766 vs 8765.)
-   4. Open the US Moda Facebook group in Chrome and leave the tab open.
-      A green badge will appear in the bottom-right and every new post
-      that comes in gets POSTed to your receiver.
-
-   FACEBOOK QUIRKS THIS SCRIPT HANDLES
-   -----------------------------------
-   - FB doesn't auto-push new posts. The script watches for the
-     "N new activity" / "new posts" button and auto-clicks it every ~30s.
-   - The feed virtualizes: old posts drop out of DOM. Capture is
-     immediate on first render — later scrolls only find newly-created
-     posts.
-   - Facebook DOM classnames randomize on every release, so we rely on
-     stable role/aria attributes.
-   - Auto-reloads the page every 10 minutes as a fallback in case FB's
-     WebSocket lags or the new-posts button doesn't appear.
+   SETUP (once):
+     1. Tampermonkey icon → Create new script → paste this file → save (⌘S).
+     2. In another Terminal:
+          cd ~/Projects/hk-watch-prices
+          ./tools/live_start_usmoda.sh
+     3. Open the FB group in Chrome — badge appears bottom-right, capture is
+        automatic. Auto-reloads every 10 min to keep the feed fresh (FB
+        doesn't push new posts like WhatsApp does).
 */
 
 (function () {
@@ -130,78 +114,108 @@
     if (!flushTimer) flushTimer = setTimeout(flush, 800);
   };
 
-  // ---- FB post extraction ----
-  // Post = <div role="article"> containing an author link and body text.
-  // Timestamp is the abbr/a element whose href includes /posts/ or /permalink/.
-  const now = () => new Date();
-  const two = (n) => String(n).padStart(2, "0");
-
-  const extractPostData = (article) => {
-    // Try to find the timestamp link
-    let ts = null;
-    for (const a of article.querySelectorAll('a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]')) {
-      const abbr = a.querySelector("abbr");
-      const title = abbr?.getAttribute("title") || a.getAttribute("aria-label");
-      if (title && /\d/.test(title)) {
-        ts = new Date(title);
-        if (!isNaN(ts)) break;
-      }
-      if (a.textContent && a.textContent.match(/^(just now|\d+\s?(s|m|h|d|w|mo|y))/i)) {
-        ts = now();  // relative — approximate with now
-        break;
-      }
-    }
-    if (!ts) ts = now();
-
-    // Author: the first link/strong inside the article's header area
-    let author = "Unknown";
-    const authorEl =
-      article.querySelector('h3 a, h2 a, strong a, a[role="link"] strong');
-    if (authorEl && authorEl.textContent.trim()) {
-      author = authorEl.textContent.trim().slice(0, 100);
-    }
-
-    // Body text — collapse the article's visible text but drop the
-    // author/timestamp header. Cheap heuristic: use innerText, remove
-    // duplicate lines, cap length.
-    const text = (article.innerText || "")
-      .split("\n")
-      .map((s) => s.trim())
-      .filter((s) => s && s.length > 1)
-      .filter((s) => s !== author)
-      .filter((s) => !/^\d+\s?(s|m|h|d|w|mo|y)$/i.test(s))
-      .filter((s) => !/^(like|comment|share|see more|see less)$/i.test(s))
-      .join(" ")
-      .slice(0, 2000);
-
-    if (!text) return null;
-
-    const date = `${two(ts.getDate())}/${two(ts.getMonth() + 1)}/${ts.getFullYear()}`;
-    const time = `${two(ts.getHours())}:${two(ts.getMinutes())}`;
-    const key = `${date}|${time}|${author}|${text.slice(0, 200)}`;
-    if (seen.has(key)) return null;
-    seen.add(key);
-    return { date, time, sender: author, text };
+  // ---- FB text cleaning ----
+  // Facebook inserts U+034F (Combining Grapheme Joiner) and other invisible
+  // chars into text as anti-bot obfuscation. We truncate at the first
+  // invisible char (everything after is garbage) and strip any strays.
+  const INVISIBLE_RE = /[͏​-‏‪-‮⁦-⁩﻿]/;
+  const INVISIBLE_STRIP = /[͏​-‏‪-‮⁦-⁩﻿]/g;
+  const cleanText = (s) => {
+    if (!s) return "";
+    const cutIdx = s.search(INVISIBLE_RE);
+    const truncated = cutIdx >= 0 ? s.slice(0, cutIdx) : s;
+    return truncated.replace(INVISIBLE_STRIP, "").trim();
   };
 
-  const capture = (root) => {
-    root.querySelectorAll('div[role="article"]').forEach((art) => {
-      const data = extractPostData(art);
-      if (data) {
-        buffer.push(data);
-        scheduleFlush();
+  // ---- Post extraction via author-link anchoring ----
+  //
+  // Each post has an author profile link `/groups/{GID}/user/{UID}/`. We
+  // walk UP from that anchor to find the post container (a div that also
+  // holds the post's body text and timestamp link). Much more robust than
+  // relying on role="article" or randomized class names.
+  const AUTHOR_LINK_SEL = 'a[href*="/groups/"][href*="/user/"]';
+
+  const findPostContainer = (authorLink) => {
+    let node = authorLink.parentElement;
+    for (let i = 0; i < 20 && node && node !== document.body; i++) {
+      // A post container has BOTH a text block (>50 chars) and a timestamp link
+      const txt = (node.innerText || "").length;
+      const hasTs = node.querySelector(
+        'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[aria-label*="ago"]'
+      );
+      if (txt > 60 && hasTs) return node;
+      node = node.parentElement;
+    }
+    return null;
+  };
+
+  const extractTimestamp = (container) => {
+    // Try multiple approaches — FB uses different formats in different contexts
+    for (const a of container.querySelectorAll(
+      'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]'
+    )) {
+      const label = a.getAttribute("aria-label");
+      if (label) {
+        const d = new Date(label);
+        if (!isNaN(d)) return d;
       }
+      const abbr = a.querySelector("abbr");
+      const title = abbr?.getAttribute("title");
+      if (title) {
+        const d = new Date(title);
+        if (!isNaN(d)) return d;
+      }
+    }
+    // Last resort: relative-time text like "5 min", "2 hr", "3d"
+    const rel = container.querySelector('a[role="link"] span, span[dir="auto"]');
+    // Just fall back to now — better than dropping the post
+    return new Date();
+  };
+
+  const two = (n) => String(n).padStart(2, "0");
+  const captured = new WeakSet();  // avoid double-processing same author-link
+
+  const captureFrom = (root) => {
+    // Query author links inside the given root (or the document if root is null)
+    const authors = (root || document).querySelectorAll(AUTHOR_LINK_SEL);
+    authors.forEach((authorLink) => {
+      if (captured.has(authorLink)) return;
+      captured.add(authorLink);
+
+      const author = cleanText(authorLink.textContent).slice(0, 100);
+      if (!author) return;
+
+      const container = findPostContainer(authorLink);
+      if (!container) return;
+
+      const rawText = container.innerText || "";
+      const text = cleanText(rawText).slice(0, 3000);
+      if (text.length < 20) return;  // probably a comment stub or empty header
+
+      const ts = extractTimestamp(container);
+      const date = `${two(ts.getDate())}/${two(ts.getMonth() + 1)}/${ts.getFullYear()}`;
+      const time = `${two(ts.getHours())}:${two(ts.getMinutes())}`;
+
+      const key = `${date}|${time}|${author}|${text.slice(0, 200)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      buffer.push({ date, time, sender: author, text });
+      scheduleFlush();
     });
   };
 
   // ---- Auto-click "N new posts" buttons ----
   const clickNewPostsButtons = () => {
-    for (const el of document.querySelectorAll('div[role="button"], span[role="button"], button')) {
+    for (const el of document.querySelectorAll(
+      'div[role="button"], span[role="button"], button'
+    )) {
       const t = (el.textContent || "").toLowerCase();
       if (
-        (t.includes("new post") || t.includes("new activit") ||
-         t.match(/^see \d+ new/) || t === "new posts") &&
-        el.offsetParent !== null  // visible
+        (t.includes("new post") ||
+          t.includes("new activit") ||
+          t.match(/^see \d+ new/) ||
+          t === "new posts") &&
+        el.offsetParent !== null
       ) {
         el.click();
         return true;
@@ -212,16 +226,30 @@
 
   // ---- Bootstrap ----
   const bootstrap = () => {
-    capture(document);
-    // Watch for new posts appearing in DOM
+    // Force CHRONOLOGICAL sort on initial load so FB doesn't show algorithmic feed
+    const url0 = new URL(location.href);
+    if (
+      url0.searchParams.get("sorting_setting") !== "CHRONOLOGICAL" &&
+      /\/groups\/[^/]+\/?$/.test(url0.pathname)
+    ) {
+      url0.searchParams.set("sorting_setting", "CHRONOLOGICAL");
+      console.log("US Moda: redirecting to CHRONOLOGICAL sort");
+      location.replace(url0.toString());
+      return;
+    }
+
+    captureFrom(null);
+
     const observer = new MutationObserver((muts) => {
-      for (const mu of muts)
-        for (const n of mu.addedNodes)
-          if (n.nodeType === 1) capture(n);
+      for (const mu of muts) {
+        for (const n of mu.addedNodes) {
+          if (n.nodeType === 1) captureFrom(n);
+        }
+      }
     });
     observer.observe(document.body, { childList: true, subtree: true });
 
-    // Retry queued items every 30s
+    // Retry stuck items every 30s
     setInterval(() => { if (buffer.length) flush(); }, 30_000);
 
     // Health-check server every 60s
@@ -236,35 +264,17 @@
     // Auto-click "new posts" every 30s
     setInterval(() => { clickNewPostsButtons(); }, 30_000);
 
-    // Periodic page reload — FB fallback when the feed goes stale.
-    // Preserves CHRONOLOGICAL sort so we don't fall back to FB's
-    // algorithmic 'Top Posts' order (which would hide fresh listings).
+    // Periodic full-page reload as fallback for stale feed
     setInterval(() => {
-      if (Date.now() - lastReloadAt >= RELOAD_EVERY_MS) {
-        if (buffer.length === 0) {
-          const url = new URL(location.href);
-          if (url.searchParams.get("sorting_setting") !== "CHRONOLOGICAL") {
-            url.searchParams.set("sorting_setting", "CHRONOLOGICAL");
-          }
-          location.replace(url.toString());
-        }
+      if (Date.now() - lastReloadAt >= RELOAD_EVERY_MS && buffer.length === 0) {
+        const url = new URL(location.href);
+        url.searchParams.set("sorting_setting", "CHRONOLOGICAL");
+        location.replace(url.toString());
       }
       updateBadge();
     }, 30_000);
 
-    // On first load, force chronological sort if the user landed without it
-    if (new URL(location.href).searchParams.get("sorting_setting") !== "CHRONOLOGICAL") {
-      const url = new URL(location.href);
-      url.searchParams.set("sorting_setting", "CHRONOLOGICAL");
-      // Only redirect if we're on the group root (avoid post-detail pages)
-      if (/\/groups\/[^/]+\/?$/.test(url.pathname)) {
-        console.log("US Moda capture: redirecting to CHRONOLOGICAL sort");
-        location.replace(url.toString());
-        return;
-      }
-    }
-
-    // Initial server check
+    // Initial server ping
     (async () => {
       try {
         await gmRequest({ method: "GET", url: `${SERVER}/status`, timeout: 3000 });
