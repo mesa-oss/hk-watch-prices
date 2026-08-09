@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      2.4
+// @version      2.5
 // @description  Live-captures posts from a Facebook group and POSTs to the local receiver. v2 uses author-profile-link detection since FB stopped using role='article' for posts, and strips invisible-character anti-bot obfuscation.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -27,7 +27,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] userscript v2.4 starting");
+  console.log("[US Moda] userscript v2.5 starting");
   const SERVER = "http://127.0.0.1:8766";
   const RELOAD_EVERY_MS = 4 * 60 * 1000;  // reload every 4 min for freshness
 
@@ -139,17 +139,46 @@
   const AUTHOR_LINK_SEL = 'a[href*="/groups/"][href*="/user/"]';
 
   const findPostContainer = (authorLink) => {
+    // Pass 1: look for FB's real post markers. These are the correct
+    // boundary of a post; text-based heuristics can overshoot into the
+    // page shell (left sidebar → "Facebook" repeats + huge innerText).
     let node = authorLink.parentElement;
-    for (let i = 0; i < 20 && node && node !== document.body; i++) {
-      // A post container has BOTH a text block (>50 chars) and a timestamp link
-      const txt = (node.innerText || "").length;
+    for (let i = 0; i < 12 && node && node !== document.body; i++) {
+      const role = node.getAttribute?.("role");
+      const pagelet = node.getAttribute?.("data-pagelet") || "";
+      if (
+        role === "article" ||
+        pagelet.startsWith("FeedUnit") ||
+        pagelet.startsWith("GroupFeed") ||
+        pagelet.startsWith("Feed")
+      ) {
+        return node;
+      }
+      node = node.parentElement;
+    }
+    // Pass 2: text-heuristic fallback with a HARD upper bound on both
+    // depth and text length — otherwise we grab the whole page including
+    // sidebar chrome (which has plenty of text + timestamp links elsewhere).
+    node = authorLink.parentElement;
+    for (let i = 0; i < 8 && node && node !== document.body; i++) {
+      const t = node.innerText || "";
       const hasTs = node.querySelector(
         'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[aria-label*="ago"]'
       );
-      if (txt > 60 && hasTs) return node;
+      if (t.length > 60 && t.length < 4000 && hasTs) return node;
       node = node.parentElement;
     }
     return null;
+  };
+
+  // Detect "this is page chrome, not a post" — the FB left sidebar has
+  // 15+ repetitions of "Facebook" as accessibility labels for recent
+  // groups. A real dealer post never has that pattern.
+  const looksLikePageChrome = (text) => {
+    const lines = text.split(/\n+/).slice(0, 30);
+    let fbCount = 0;
+    for (const l of lines) if (l.trim() === "Facebook") fbCount++;
+    return fbCount >= 3;
   };
 
   const extractTimestamp = (container) => {
@@ -282,6 +311,14 @@
       }
 
       const rawText = container.innerText || "";
+      // Sidebar chrome sanity check: if we grabbed page shell, drop it
+      // permanently for this authorLink so we don't spam retries.
+      if (looksLikePageChrome(rawText)) {
+        dbg("skip page-chrome (wrong container):", author);
+        captured.add(authorLink);
+        return;
+      }
+
       // Skip re-scanning identical content. Recheck when text length grows
       // (e.g. after "See more" expands the post).
       const len = rawText.length;
@@ -291,7 +328,8 @@
       const text = cleanText(rawText).slice(0, 3000);
       if (!looksLikeListing(text)) {
         dbg("skip not-a-listing:", author, "len=" + len,
-            "text:", text.slice(0, 120));
+            "clean-len=" + text.length,
+            "text:", text.slice(0, 200));
         // Don't add to captured — text may expand and pass later
         return;
       }
