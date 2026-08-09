@@ -345,6 +345,25 @@ def _extract_eur(line: str) -> int | None:
             if 500 <= amt <= 20_000_000:
                 return int(amt)
 
+    # 1b) Decimal shorthand meaning thousands: '€24.5' = 24,500€.
+    # Some EU dealers omit the 'k' when the amount is a decimal under 100.
+    # Only fires when NO k/m suffix follows (those are handled above) and
+    # the decimal has 1-2 whole-number digits (larger values are literal).
+    for pat in [
+        re.compile(r"€\s*(\d{1,2}\.\d{1,3})(?![\d kKmM])"),
+        re.compile(r"(\d{1,2}\.\d{1,3})\s*€(?!\s*[kKmM])"),
+        re.compile(r"EUR\s*(\d{1,2}\.\d{1,3})\b(?!\s*[kKmM])", re.I),
+        re.compile(r"(\d{1,2}\.\d{1,3})\s*(?:EUR|EURO|EUROS)\b(?!\s*[kKmM])", re.I),
+    ]:
+        m = pat.search(line)
+        if m:
+            try:
+                amt = float(m.group(1)) * 1_000
+            except ValueError:
+                continue
+            if 500 <= amt <= 20_000_000:
+                return int(amt)
+
     # 2) European thousands-separator formats (no k/m suffix)
     pats = [
         re.compile(r"(\d{1,3}(?:[\.,\'’ \s]\d{3})+)\s*€"),
