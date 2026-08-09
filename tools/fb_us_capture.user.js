@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      3.9
+// @version      3.10
 // @description  Intercepts Facebook's GraphQL responses via unsafeWindow (bypasses TM sandbox AND FB's CSP). No inline injection, no DOM parsing.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -31,7 +31,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] v3.9 (deeper cycles for busy days) starting");
+  console.log("[US Moda] v3.10 (deep first-cycle for wake-from-sleep catch-up) starting");
   const SERVER = "http://127.0.0.1:8766";
 
   // Force chronological sort so we see the newest listings first.
@@ -337,13 +337,34 @@
   //   3. Between reloads, also click any "N new posts" button FB shows
   //      when new content appears above the fold — that jumps to the top
   //      without a full reload.
-  // 12 scrolls × 5s = 60s of scrolling, then 30s idle before the 90s reload.
-  // Each scroll loads ~8 posts, so we capture ~100 posts per cycle. Busy
-  // dealer days rarely see more than a few posts per minute, so this gives
-  // us ~10-20x headroom before anything slides past our capture window.
-  const INITIAL_SCROLLS = 12;
+  // Normal cycle: 12 scrolls × 5s = 60s scrolling, then 30s idle before
+  // the 90s reload. ~100 posts captured per cycle. Comfortable margin
+  // for ~200-300 posts/day (that's 1 post every 5 min average).
+  //
+  // First cycle only: 30 scrolls (~240 posts, ~20 hours of history). This
+  // matters when the laptop wakes from sleep — during sleep, nothing was
+  // captured, so on the first reload we need to reach back further to
+  // pick up everything posted while we were offline. After that, normal
+  // 12-scroll cycles pick up the trickle of new posts.
+  const NORMAL_SCROLLS = 12;
+  const CATCH_UP_SCROLLS = 30;
   const INITIAL_SCROLL_GAP_MS = 5_000;
   const RELOAD_EVERY_MS = 90 * 1000;
+  // First page load OR any load where the previous reload was ≥5min ago
+  // (i.e. we probably slept) triggers the deeper catch-up scroll.
+  const isCatchUpLoad = (() => {
+    try {
+      const last = parseInt(localStorage.getItem("usmoda_last_load_ts") || "0", 10);
+      const gap = Date.now() - last;
+      localStorage.setItem("usmoda_last_load_ts", String(Date.now()));
+      return !last || gap > 5 * 60 * 1000;   // >5min gap = catch-up mode
+    } catch (_) { return true; }
+  })();
+  const INITIAL_SCROLLS = isCatchUpLoad ? CATCH_UP_SCROLLS : NORMAL_SCROLLS;
+  console.log(
+    `[US Moda] cycle mode: ${isCatchUpLoad ? "CATCH-UP" : "normal"} `
+    + `(${INITIAL_SCROLLS} scrolls this cycle)`
+  );
   const startTime = Date.now();
   let doneInitialScrolls = 0;
 
