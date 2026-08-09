@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      2.0
+// @version      2.4
 // @description  Live-captures posts from a Facebook group and POSTs to the local receiver. v2 uses author-profile-link detection since FB stopped using role='article' for posts, and strips invisible-character anti-bot obfuscation.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -27,7 +27,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] userscript v2.1 starting");
+  console.log("[US Moda] userscript v2.4 starting");
   const SERVER = "http://127.0.0.1:8766";
   const RELOAD_EVERY_MS = 4 * 60 * 1000;  // reload every 4 min for freshness
 
@@ -176,7 +176,37 @@
   };
 
   const two = (n) => String(n).padStart(2, "0");
-  const captured = new WeakSet();  // avoid double-processing same author-link
+  const captured = new WeakSet();  // successfully-sent posts: never retry
+  // Cache last-seen text length per author-link. If length grows (e.g. after
+  // "See more" expansion), re-attempt the capture. Skips re-scanning stable
+  // posts on every MutationObserver tick.
+  const lastLen = new WeakMap();
+
+  // Click "See more" buttons to expand truncated post text. FB truncates
+  // long posts and hides the rest behind a button — the ref number and
+  // price are often *inside* the hidden portion, so container.innerText
+  // returns a useless preview and looksLikeListing() rejects it. We click
+  // aggressively (every 3s) so posts self-expand as they scroll into view.
+  const SEE_MORE_TEXTS = new Set([
+    "see more", "…see more", "see more…", "... see more", "see more...",
+    "voir plus", "…voir plus", "voir plus…",  // French
+    "mehr anzeigen",                            // German
+    "ver más",                                  // Spanish
+    "altro",                                    // Italian
+  ]);
+  const expandAllSeeMore = () => {
+    let n = 0;
+    for (const el of document.querySelectorAll(
+      'div[role="button"], span[role="button"]'
+    )) {
+      if (!el.offsetParent) continue;  // must be visible
+      const t = (el.textContent || "").trim().toLowerCase();
+      if (SEE_MORE_TEXTS.has(t)) {
+        try { el.click(); n++; } catch (_) {}
+      }
+    }
+    if (n) dbg(`expanded ${n} "See more"`);
+  };
 
   // Skip these "authors" — either FB itself, generic system pages, or noise.
   const AUTHOR_BLOCKLIST = new Set([
@@ -223,33 +253,61 @@
     return false;
   };
 
+  // Toggle DEBUG=true to log every decision to console. Helps see WHY
+  // real posts are being rejected. Turn off once filter is tuned.
+  const DEBUG = true;
+  const dbg = (...args) => { if (DEBUG) console.log("[US Moda]", ...args); };
+
   const captureFrom = (root) => {
     const authors = (root || document).querySelectorAll(AUTHOR_LINK_SEL);
     authors.forEach((authorLink) => {
       if (captured.has(authorLink)) return;
-      captured.add(authorLink);
-
-      // Skip comment authors
-      if (isInsideComments(authorLink)) return;
 
       const author = cleanText(authorLink.textContent).slice(0, 100);
       if (!author) return;
-      if (AUTHOR_BLOCKLIST.has(author.toLowerCase())) return;
+      if (AUTHOR_BLOCKLIST.has(author.toLowerCase())) {
+        captured.add(authorLink);  // permanent: name never changes
+        return;
+      }
+
+      if (isInsideComments(authorLink)) {
+        captured.add(authorLink);  // permanent: structural
+        return;
+      }
 
       const container = findPostContainer(authorLink);
-      if (!container) return;
+      if (!container) {
+        // Don't add to captured — container may appear as page loads more
+        return;
+      }
 
       const rawText = container.innerText || "";
+      // Skip re-scanning identical content. Recheck when text length grows
+      // (e.g. after "See more" expands the post).
+      const len = rawText.length;
+      if (lastLen.get(authorLink) === len) return;
+      lastLen.set(authorLink, len);
+
       const text = cleanText(rawText).slice(0, 3000);
-      if (!looksLikeListing(text)) return;
+      if (!looksLikeListing(text)) {
+        dbg("skip not-a-listing:", author, "len=" + len,
+            "text:", text.slice(0, 120));
+        // Don't add to captured — text may expand and pass later
+        return;
+      }
 
       const ts = extractTimestamp(container);
       const date = `${two(ts.getDate())}/${two(ts.getMonth() + 1)}/${ts.getFullYear()}`;
       const time = `${two(ts.getHours())}:${two(ts.getMinutes())}`;
 
       const key = `${date}|${time}|${author}|${text.slice(0, 200)}`;
-      if (seen.has(key)) return;
+      if (seen.has(key)) {
+        captured.add(authorLink);  // done — no need to rescan
+        return;
+      }
       seen.add(key);
+      captured.add(authorLink);
+      dbg("✅ CAPTURED:", author, "→", text.slice(0, 80));
       buffer.push({ date, time, sender: author, text });
       scheduleFlush();
     });
@@ -314,6 +372,12 @@
 
     // Auto-click "new posts" every 30s
     setInterval(() => { clickNewPostsButtons(); }, 30_000);
+
+    // Auto-expand truncated posts every 3s — the ref/price are almost
+    // always inside the "See more" portion of long dealer posts.
+    setInterval(expandAllSeeMore, 3_000);
+    // Also do a first-pass expansion right at bootstrap
+    setTimeout(expandAllSeeMore, 1_500);
 
     // Periodic full-page reload as fallback for stale feed
     setInterval(() => {
