@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      3.6
+// @version      3.7
 // @description  Intercepts Facebook's GraphQL responses via unsafeWindow (bypasses TM sandbox AND FB's CSP). No inline injection, no DOM parsing.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -31,7 +31,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] v3.6 (unsafeWindow hook + auto-scroll) starting");
+  console.log("[US Moda] v3.7 (top-of-feed auto-scroll) starting");
   const SERVER = "http://127.0.0.1:8766";
 
   // Force chronological sort so we see the newest listings first.
@@ -323,46 +323,83 @@
   setInterval(() => { if (buffer.length) flush(); }, 30_000);
   setInterval(updateBadge, 5_000);
 
-  // ---------- Auto-scroll ----------
+  // ---------- Auto-scroll strategy ----------
   //
-  // Every SCROLL_EVERY_MS: scroll down ~1 viewport, which triggers FB's
-  // IntersectionObserver to fetch the next batch of posts (each scroll
-  // causes a /api/graphql/ request that our hook then parses).
+  // Chronological FB feed: newest post is at the TOP. Old posts load as
+  // you scroll down. So the wrong thing to do is scroll down forever —
+  // you just wander further into old listings and never see anything new.
   //
-  // Every RELOAD_EVERY_MS: reload the page so we jump back to the top
-  // of the chronological feed and pick up brand-new posts. Chronological
-  // sort puts the newest at the top; if we only ever scroll down, we'd
-  // just read older and older listings and miss new ones.
-  const SCROLL_EVERY_MS = 20_000;
-  const RELOAD_EVERY_MS = 8 * 60 * 1000;
+  // Correct pattern for capturing new listings:
+  //   1. On page load: burst-scroll DOWN a few times to load ~40 posts of
+  //      historical baseline (each scroll = one /api/graphql/ request).
+  //   2. Then wait, and reload to top every RELOAD_EVERY_MS. Each reload
+  //      returns us to the top with any brand-new posts included.
+  //   3. Between reloads, also click any "N new posts" button FB shows
+  //      when new content appears above the fold — that jumps to the top
+  //      without a full reload.
+  const INITIAL_SCROLLS = 5;
+  const INITIAL_SCROLL_GAP_MS = 4_000;
+  const RELOAD_EVERY_MS = 3 * 60 * 1000;   // 3 min: aggressive because
+                                            // new listings are the whole point
   const startTime = Date.now();
+  let doneInitialScrolls = 0;
 
   const scrollDown = () => {
-    // Some FB layouts scroll the whole document; others scroll a nested
-    // container. Try both to be safe.
-    try { W.scrollBy(0, W.innerHeight * 0.8); } catch (_) {}
-    // The main feed can also live inside a role="main" element
+    try { W.scrollBy(0, W.innerHeight * 0.9); } catch (_) {}
     try {
       const main = document.querySelector('div[role="main"]');
-      if (main && main.scrollBy) main.scrollBy(0, W.innerHeight * 0.8);
+      if (main && main.scrollBy) main.scrollBy(0, W.innerHeight * 0.9);
     } catch (_) {}
   };
 
-  const scrollTick = () => {
-    // If page has been open long enough, reload to reset to top-of-feed
-    if (Date.now() - startTime >= RELOAD_EVERY_MS) {
-      const url = new URL(W.location.href);
-      url.searchParams.set("sorting_setting", "CHRONOLOGICAL");
-      console.log("[US Moda] auto-reload to top of feed");
-      W.location.replace(url.toString());
-      return;
+  const clickNewPostsBanner = () => {
+    // FB shows a "N new posts" banner at the top when new content arrives.
+    // Clicking it jumps to top and loads the new posts.
+    for (const el of document.querySelectorAll(
+      'div[role="button"], span[role="button"], button'
+    )) {
+      if (!el.offsetParent) continue;
+      const t = (el.textContent || "").toLowerCase().trim();
+      if (
+        /^see \d+ new/.test(t) ||
+        t === "new posts" ||
+        t.includes("new post") ||
+        t.includes("new activit")
+      ) {
+        try { el.click(); return true; } catch (_) {}
+      }
     }
-    scrollDown();
+    return false;
   };
 
-  // First scroll after 5s (page needs to settle first)
-  setTimeout(scrollTick, 5_000);
-  setInterval(scrollTick, SCROLL_EVERY_MS);
+  const doReload = () => {
+    const url = new URL(W.location.href);
+    url.searchParams.set("sorting_setting", "CHRONOLOGICAL");
+    console.log("[US Moda] auto-reload → top of feed");
+    W.location.replace(url.toString());
+  };
 
-  console.log("[US Moda] setup done — auto-scroll running (no manual scrolling needed)");
+  // Phase 1: burst-scroll for baseline
+  const initialScrollTick = () => {
+    if (doneInitialScrolls >= INITIAL_SCROLLS) return;
+    doneInitialScrolls++;
+    console.log(`[US Moda] initial scroll ${doneInitialScrolls}/${INITIAL_SCROLLS}`);
+    scrollDown();
+    setTimeout(initialScrollTick, INITIAL_SCROLL_GAP_MS);
+  };
+  setTimeout(initialScrollTick, 5_000);
+
+  // Phase 2: keep clicking "new posts" banner + eventually reload
+  setInterval(() => {
+    if (Date.now() - startTime >= RELOAD_EVERY_MS) {
+      doReload();
+      return;
+    }
+    // Between reloads, try to catch newly-arrived posts without reloading
+    if (clickNewPostsBanner()) {
+      console.log("[US Moda] clicked 'new posts' banner");
+    }
+  }, 15_000);
+
+  console.log("[US Moda] setup done — auto-scroll running (top-of-feed strategy)");
 })();
