@@ -350,14 +350,14 @@ def _extract_eur(line: str) -> int | None:
     # Only fires when NO k/m suffix follows (those are handled above) and
     # the decimal has 1-2 whole-number digits (larger values are literal).
     for pat in [
-        re.compile(r"€\s*(\d{1,2}\.\d{1,3})(?![\d kKmM])"),
+        re.compile(r"€\s*(\d{1,2}\.\d{1,3})(?![\dkKmM])"),
         re.compile(r"(\d{1,2}\.\d{1,3})\s*€(?!\s*[kKmM])"),
         re.compile(r"EUR\s*(\d{1,2}\.\d{1,3})\b(?!\s*[kKmM])", re.I),
         re.compile(r"(\d{1,2}\.\d{1,3})\s*(?:EUR|EURO|EUROS)\b(?!\s*[kKmM])", re.I),
         # Comma-as-decimal (EU convention): €24,5 = 24,500. Restricted
         # to 1-2 digits after the comma so we don't collide with the
         # English thousands separator handled by the existing patterns.
-        re.compile(r"€\s*(\d{1,2},\d{1,2})(?![\d kKmM])"),
+        re.compile(r"€\s*(\d{1,2},\d{1,2})(?![\dkKmM])"),
         re.compile(r"(\d{1,2},\d{1,2})\s*€(?!\s*[kKmM])"),
         re.compile(r"EUR\s*(\d{1,2},\d{1,2})\b(?!\s*[kKmM])", re.I),
         re.compile(r"(\d{1,2},\d{1,2})\s*(?:EUR|EURO|EUROS)\b(?!\s*[kKmM])", re.I),
