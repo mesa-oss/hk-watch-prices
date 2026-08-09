@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      3.5
+// @version      3.6
 // @description  Intercepts Facebook's GraphQL responses via unsafeWindow (bypasses TM sandbox AND FB's CSP). No inline injection, no DOM parsing.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -31,7 +31,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] v3.5 (unsafeWindow hook, production) starting");
+  console.log("[US Moda] v3.6 (unsafeWindow hook + auto-scroll) starting");
   const SERVER = "http://127.0.0.1:8766";
 
   // Fall back to window if unsafeWindow isn't granted (shouldn't happen with our header)
@@ -307,5 +307,46 @@
   setInterval(() => { if (buffer.length) flush(); }, 30_000);
   setInterval(updateBadge, 5_000);
 
-  console.log("[US Moda] setup done — scroll the group feed to trigger requests");
+  // ---------- Auto-scroll ----------
+  //
+  // Every SCROLL_EVERY_MS: scroll down ~1 viewport, which triggers FB's
+  // IntersectionObserver to fetch the next batch of posts (each scroll
+  // causes a /api/graphql/ request that our hook then parses).
+  //
+  // Every RELOAD_EVERY_MS: reload the page so we jump back to the top
+  // of the chronological feed and pick up brand-new posts. Chronological
+  // sort puts the newest at the top; if we only ever scroll down, we'd
+  // just read older and older listings and miss new ones.
+  const SCROLL_EVERY_MS = 20_000;
+  const RELOAD_EVERY_MS = 8 * 60 * 1000;
+  const startTime = Date.now();
+
+  const scrollDown = () => {
+    // Some FB layouts scroll the whole document; others scroll a nested
+    // container. Try both to be safe.
+    try { W.scrollBy(0, W.innerHeight * 0.8); } catch (_) {}
+    // The main feed can also live inside a role="main" element
+    try {
+      const main = document.querySelector('div[role="main"]');
+      if (main && main.scrollBy) main.scrollBy(0, W.innerHeight * 0.8);
+    } catch (_) {}
+  };
+
+  const scrollTick = () => {
+    // If page has been open long enough, reload to reset to top-of-feed
+    if (Date.now() - startTime >= RELOAD_EVERY_MS) {
+      const url = new URL(W.location.href);
+      url.searchParams.set("sorting_setting", "CHRONOLOGICAL");
+      console.log("[US Moda] auto-reload to top of feed");
+      W.location.replace(url.toString());
+      return;
+    }
+    scrollDown();
+  };
+
+  // First scroll after 5s (page needs to settle first)
+  setTimeout(scrollTick, 5_000);
+  setInterval(scrollTick, SCROLL_EVERY_MS);
+
+  console.log("[US Moda] setup done — auto-scroll running (no manual scrolling needed)");
 })();
