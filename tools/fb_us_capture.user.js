@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      2.7
+// @version      2.8
 // @description  Live-captures posts from a Facebook group and POSTs to the local receiver. v2 uses author-profile-link detection since FB stopped using role='article' for posts, and strips invisible-character anti-bot obfuscation.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -27,7 +27,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] userscript v2.7 starting");
+  console.log("[US Moda] userscript v2.8 starting");
   const SERVER = "http://127.0.0.1:8766";
   const RELOAD_EVERY_MS = 4 * 60 * 1000;  // reload every 4 min for freshness
 
@@ -143,9 +143,13 @@
     // boundary of a post; text-based heuristics can overshoot into the
     // page shell (left sidebar → "Facebook" repeats + huge innerText).
     let node = authorLink.parentElement;
-    for (let i = 0; i < 12 && node && node !== document.body; i++) {
+    for (let i = 0; i < 20 && node && node !== document.body; i++) {
       const role = node.getAttribute?.("role");
       const pagelet = node.getAttribute?.("data-pagelet") || "";
+      // Stop if we're about to walk into the feed shell — the parent of
+      // articles is role="feed" or role="main"; walking through it lands
+      // in the page chrome with 20k+ chars including sidebar.
+      if (role === "feed" || role === "main") return null;
       if (
         role === "article" ||
         pagelet.startsWith("FeedUnit") ||
@@ -156,20 +160,27 @@
       }
       node = node.parentElement;
     }
-    // Pass 2: text-heuristic fallback with a HARD upper bound on both
-    // depth and text length — otherwise we grab the whole page including
-    // sidebar chrome (which has plenty of text + timestamp links elsewhere).
+    // Pass 2: text-heuristic fallback. Upper bound raised to 20k because
+    // posts with comments expanded can easily hit 5-8k chars, and we now
+    // rely on the feed/main stop above to prevent grabbing page shell.
     node = authorLink.parentElement;
-    for (let i = 0; i < 8 && node && node !== document.body; i++) {
+    for (let i = 0; i < 12 && node && node !== document.body; i++) {
+      const role = node.getAttribute?.("role");
+      if (role === "feed" || role === "main") return null;
       const t = node.innerText || "";
       const hasTs = node.querySelector(
         'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[aria-label*="ago"]'
       );
-      if (t.length > 60 && t.length < 4000 && hasTs) return node;
+      if (t.length > 60 && t.length < 20000 && hasTs) return node;
       node = node.parentElement;
     }
     return null;
   };
+
+  // WeakSet of post containers we already captured. Each post has 2+
+  // author links (avatar link + name link, same href, different DOM
+  // nodes). Dedup at the container level so we process each post once.
+  const processedContainers = new WeakSet();
 
   // Detect "this is page chrome, not a post" — the FB left sidebar has
   // 15+ repetitions of "Facebook" as accessibility labels for recent
@@ -305,8 +316,23 @@
         authorLink.getAttribute("aria-label") ||
         ""
       ).slice(0, 100);
-      if (!author) { stats.emptyAuthor++; return; }
-      if (AUTHOR_BLOCKLIST.has(author.toLowerCase())) {
+      // Empty-author case = avatar link. Don't reject — find the sibling
+      // name link with same href and use its text. Every post has both
+      // an avatar (<a><img></a>) and a name (<a>Name</a>) link to the
+      // same profile URL. Container dedup below prevents double-processing.
+      let effectiveAuthor = author;
+      if (!effectiveAuthor) {
+        const sameHrefLinks = document.querySelectorAll(
+          `a[href="${authorLink.getAttribute("href")}"]`
+        );
+        for (const l of sameHrefLinks) {
+          const t = cleanText(l.textContent || "").slice(0, 100);
+          if (t) { effectiveAuthor = t; break; }
+        }
+      }
+      if (!effectiveAuthor) { stats.emptyAuthor++; return; }
+
+      if (AUTHOR_BLOCKLIST.has(effectiveAuthor.toLowerCase())) {
         captured.add(authorLink);  // permanent: name never changes
         stats.blocklist++;
         return;
@@ -325,11 +351,18 @@
         return;
       }
 
+      // Avatar link + name link map to the same container. If we've
+      // already processed this container, skip silently.
+      if (processedContainers.has(container)) {
+        captured.add(authorLink);
+        return;
+      }
+
       const rawText = container.innerText || "";
       // Sidebar chrome sanity check: if we grabbed page shell, drop it
       // permanently for this authorLink so we don't spam retries.
       if (looksLikePageChrome(rawText)) {
-        dbg("skip page-chrome (wrong container):", author);
+        dbg("skip page-chrome (wrong container):", effectiveAuthor);
         captured.add(authorLink);
         stats.pageChrome++;
         return;
@@ -344,7 +377,7 @@
       const text = cleanText(rawText).slice(0, 3000);
       if (!looksLikeListing(text)) {
         stats.notListing++;
-        dbg("skip not-a-listing:", author, "len=" + len,
+        dbg("skip not-a-listing:", effectiveAuthor, "len=" + len,
             "clean-len=" + text.length,
             "text:", text.slice(0, 200));
         // Don't add to captured — text may expand and pass later
@@ -355,17 +388,19 @@
       const date = `${two(ts.getDate())}/${two(ts.getMonth() + 1)}/${ts.getFullYear()}`;
       const time = `${two(ts.getHours())}:${two(ts.getMinutes())}`;
 
-      const key = `${date}|${time}|${author}|${text.slice(0, 200)}`;
+      const key = `${date}|${time}|${effectiveAuthor}|${text.slice(0, 200)}`;
       if (seen.has(key)) {
         captured.add(authorLink);  // done — no need to rescan
+        processedContainers.add(container);
         stats.dup++;
         return;
       }
       seen.add(key);
       captured.add(authorLink);
+      processedContainers.add(container);
       stats.captured++;
-      dbg("✅ CAPTURED:", author, "→", text.slice(0, 80));
-      buffer.push({ date, time, sender: author, text });
+      dbg("✅ CAPTURED:", effectiveAuthor, "→", text.slice(0, 80));
+      buffer.push({ date, time, sender: effectiveAuthor, text });
       scheduleFlush();
     });
     // Summary line so you can see the rejection distribution at a glance
