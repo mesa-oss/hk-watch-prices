@@ -81,6 +81,11 @@ REFERENCE_PATTERNS = [
     re.compile(r"\b(\d{3}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{3})\b"),
     # A. Lange: 101.027, 405.035, 232.026 (negative-lookahead so it doesn't eat Omega's prefix)
     re.compile(r"\b(\d{3}\.\d{3})(?!\d|\.)"),
+    # Rolex VINTAGE 4-digit: 5513, 1680, 6263, 6239, 1675, 1655, 6538,
+    # 3135, etc. Bare 4 digits with no letter suffix. Require the word
+    # "Rolex" nearby so we don't grab random 4-digit numbers as refs.
+    # Year-shape rejects (19xx/20xx) still applied via extract_reference.
+    re.compile(r"\bRolex\s+(\d{4})\b(?!\d|[A-Za-z/])", re.I),
     # Rolex: 126234, 126503, 116503, 336938, 277200, 116505-0001
     re.compile(r"\b(1\d{5}[A-Z]{0,5}(?:-\d{4})?)\b", re.I),
     re.compile(r"\b(2\d{5}[A-Z]{0,5}(?:-\d{4})?)\b", re.I),
