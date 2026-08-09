@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      3.4
+// @version      3.5
 // @description  Intercepts Facebook's GraphQL responses via unsafeWindow (bypasses TM sandbox AND FB's CSP). No inline injection, no DOM parsing.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -31,7 +31,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] v3.4 (unsafeWindow hook + response diagnostics) starting");
+  console.log("[US Moda] v3.5 (unsafeWindow hook, production) starting");
   const SERVER = "http://127.0.0.1:8766";
 
   // Fall back to window if unsafeWindow isn't granted (shouldn't happen with our header)
@@ -117,11 +117,21 @@
   };
 
   // ---------- Post extraction ----------
+  // FB dealers use Unicode Bold ("𝐑𝐋𝐗 𝟏𝟐𝟔𝟕𝟏𝟗") to stand out. Those are
+  // Mathematical Alphanumeric Symbols — different codepoints from plain
+  // ASCII, so the Python parser's regexes won't match them. NFKC
+  // normalization folds those styled characters back to ASCII equivalents.
+  const normalize = (s) => {
+    if (!s) return s;
+    try { return s.normalize("NFKC"); }
+    catch (_) { return s; }
+  };
+
   const emit = (author, text, timeSec, id) => {
     if (!author || !text) return;
-    text = String(text).trim();
+    text = normalize(String(text)).trim();
     if (text.length < 20) return;
-    author = String(author).trim().slice(0, 100);
+    author = normalize(String(author)).trim().slice(0, 100);
     if (!author) return;
 
     const key = id || `${author}|${text.slice(0, 120)}`;
@@ -189,37 +199,16 @@
     }
   };
 
-  let parseCount = 0;
-  const parseBody = (body, sourceUrl) => {
-    parseCount++;
-    if (!body || typeof body !== "string") {
-      if (parseCount <= 3) console.log(`[US Moda] parseBody #${parseCount}: empty/non-string body from ${sourceUrl}`);
-      return;
-    }
+  const parseBody = (body) => {
+    if (!body || typeof body !== "string") return;
     if (body.startsWith("for (;;);")) body = body.slice(9);
     if (body.startsWith(")]}'")) body = body.slice(4);
-
-    let extractedThisResponse = 0;
-    const before = extractedPosts;
     for (const line of body.split("\n")) {
       const t = line.trim();
       if (!t.startsWith("{")) continue;
       try { walkForPosts(JSON.parse(t)); } catch (_) {}
     }
     try { walkForPosts(JSON.parse(body)); } catch (_) {}
-    extractedThisResponse = extractedPosts - before;
-
-    // For the first few responses, dump a preview so we can see the shape
-    if (parseCount <= 5 || extractedThisResponse > 0) {
-      const short = (sourceUrl || "").split("?")[0].slice(0, 60);
-      console.log(
-        `[US Moda] parseBody #${parseCount} ${short} bodyLen=${body.length} extracted=${extractedThisResponse}`
-      );
-      if (parseCount <= 3 && body.length > 100) {
-        // Print first 400 chars of body so we can see the structure
-        console.log(`[US Moda] body preview:`, body.slice(0, 400));
-      }
-    }
   };
 
   const shouldIntercept = (url) => {
@@ -235,19 +224,10 @@
     );
   };
 
-  // ---------- URL diagnostics ----------
-  // Buffered log so we don't flood the console.
-  const urlLog = [];
-  const noteUrl = (kind, url) => {
-    if (!url) return;
-    urlLog.push(`${kind} ${url.slice(0, 150)}`);
-    if (urlLog.length === 1) {
-      setTimeout(() => {
-        console.log("[US Moda] URLs seen (last 3s):\n" + urlLog.join("\n"));
-        urlLog.length = 0;
-      }, 3000);
-    }
-  };
+  // URL noise diagnostics — kept as no-op in prod. Uncomment the body
+  // and toggle DEBUG at top if you need to inspect which endpoints FB
+  // is calling on a page you haven't seen before.
+  const noteUrl = (_kind, _url) => {};
 
   // ---------- Hook fetch on the REAL page window ----------
   const origFetch = W.fetch;
