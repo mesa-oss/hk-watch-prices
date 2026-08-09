@@ -157,10 +157,19 @@ def render_market_view(market: str) -> None:
     tabs — typing '5167' in HK doesn't affect what's shown in the EU tab.
     """
     total, n_refs, min_d, max_d = overall_stats(market)
+    date_range = (
+        f"{min_d[:10]} → {max_d[:10]}" if (min_d and max_d) else "no data yet"
+    )
     st.caption(
         f"{MARKET_LABEL.get(market, market.upper())} · {total:,} listings · "
-        f"{n_refs:,} refs · {min_d[:10]} → {max_d[:10]}"
+        f"{n_refs:,} refs · {date_range}"
     )
+    if total == 0:
+        st.info(
+            f"No listings in {MARKET_LABEL.get(market, market)} yet — "
+            f"waiting for the first refresh to capture data."
+        )
+        return
 
     # Filters
     top1, top2 = st.columns([2, 1])
