@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      3.8
+// @version      3.9
 // @description  Intercepts Facebook's GraphQL responses via unsafeWindow (bypasses TM sandbox AND FB's CSP). No inline injection, no DOM parsing.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -31,7 +31,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] v3.8 (top-of-feed, 90s reloads) starting");
+  console.log("[US Moda] v3.9 (deeper cycles for busy days) starting");
   const SERVER = "http://127.0.0.1:8766";
 
   // Force chronological sort so we see the newest listings first.
@@ -337,10 +337,13 @@
   //   3. Between reloads, also click any "N new posts" button FB shows
   //      when new content appears above the fold — that jumps to the top
   //      without a full reload.
-  const INITIAL_SCROLLS = 5;
-  const INITIAL_SCROLL_GAP_MS = 4_000;
-  const RELOAD_EVERY_MS = 90 * 1000;       // 90s: aggressive capture of
-                                            // brand-new listings as they post
+  // 12 scrolls × 5s = 60s of scrolling, then 30s idle before the 90s reload.
+  // Each scroll loads ~8 posts, so we capture ~100 posts per cycle. Busy
+  // dealer days rarely see more than a few posts per minute, so this gives
+  // us ~10-20x headroom before anything slides past our capture window.
+  const INITIAL_SCROLLS = 12;
+  const INITIAL_SCROLL_GAP_MS = 5_000;
+  const RELOAD_EVERY_MS = 90 * 1000;
   const startTime = Date.now();
   let doneInitialScrolls = 0;
 
