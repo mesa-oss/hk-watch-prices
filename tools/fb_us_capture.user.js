@@ -29,7 +29,7 @@
 
   console.log("[US Moda] userscript v2.1 starting");
   const SERVER = "http://127.0.0.1:8766";
-  const RELOAD_EVERY_MS = 10 * 60 * 1000;
+  const RELOAD_EVERY_MS = 4 * 60 * 1000;  // reload every 4 min for freshness
 
   const gmRequest = (opts) =>
     new Promise((resolve, reject) => {
@@ -186,13 +186,26 @@
 
   // A post is worth capturing only if it has REAL trading content.
   // Comments like "beautiful watch, glws" or "still available?" don't.
+  // Requires ONE strong signal (price with $ or €) plus ANY hint of
+  // watch content (ref-number pattern OR brand keyword).
   const looksLikeListing = (text) => {
-    if (text.length < 60) return false;   // comments are usually short
-    // Must contain a price signal OR a plausible ref-number pattern
-    const hasPrice = /\$\s?\d|\€\s?\d|\d\s?(?:usd|eur|hkd|k\b)/i.test(text);
-    const hasRef = /\b(?:1[12]\d{4}|2[67]\d{4}|5\d{3}[A-Z]|W[A-Z0-9]{6})\b/.test(text);
-    const hasBrand = /\b(?:Rolex|Patek|Audemars|Cartier|Hublot|Omega|Tudor|Panerai|Vacheron|Richard\s?Mille|AP|VC|RM|PP)\b/i.test(text);
-    return (hasPrice || hasRef) && hasBrand;
+    if (text.length < 60) return false;
+    // Explicit dealer-price signal: dollar/euro amount, or "USD 5000",
+    // or numeric+k/m (e.g. "17k"). Bare 4-6 digit numbers don't count
+    // (too many false positives — year, quantity, etc.).
+    const hasPrice =
+      /\$\s?\d{2,}|\€\s?\d{2,}|\bUSD\s?\d|\bEUR\s?\d|\d+\s?[kKmM]\b/i.test(text);
+    // Any of: 5-6 digit Rolex-shape ref, W-prefixed Cartier ref, 4-digit
+    // Patek/AP ref with letter suffix.
+    const hasRef =
+      /\b(?:1[12]\d{4}|[23]\d{5}|5\d{3}[A-Z]|W[A-Z0-9]{5,7})\b/.test(text);
+    const hasBrand =
+      /\b(?:Rolex|RLX|Patek|Audemars\s?Piguet|AP|Cartier|Hublot|Omega|Tudor|Panerai|Vacheron|Richard\s?Mille|RM|PP|VC|Bvlgari|Breguet|IWC|Lange|Daytona|Datejust|Submariner|Nautilus|Royal\s?Oak|Aquanaut)\b/i.test(
+        text
+      );
+    // Need a price signal AND at least one of (ref pattern OR brand keyword).
+    // '$64,000 + label 126688' passes even without saying 'Rolex'.
+    return hasPrice && (hasRef || hasBrand);
   };
 
   // Is this author link inside a comments section? Walk up looking for
