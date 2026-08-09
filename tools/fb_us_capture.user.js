@@ -27,6 +27,7 @@
 (function () {
   "use strict";
 
+  console.log("[US Moda] userscript v2.1 starting");
   const SERVER = "http://127.0.0.1:8766";
   const RELOAD_EVERY_MS = 10 * 60 * 1000;
 
@@ -118,8 +119,10 @@
   // Facebook inserts U+034F (Combining Grapheme Joiner) and other invisible
   // chars into text as anti-bot obfuscation. We truncate at the first
   // invisible char (everything after is garbage) and strip any strays.
-  const INVISIBLE_RE = /[͏​-‏‪-‮⁦-⁩﻿]/;
-  const INVISIBLE_STRIP = /[͏​-‏‪-‮⁦-⁩﻿]/g;
+  // Using explicit \uXXXX escapes — inline invisible chars can be parsed
+  // ambiguously in a regex character class and silently break the script.
+  const INVISIBLE_RE = /[\u034F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/;
+  const INVISIBLE_STRIP = /[\u034F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
   const cleanText = (s) => {
     if (!s) return "";
     const cutIdx = s.search(INVISIBLE_RE);
