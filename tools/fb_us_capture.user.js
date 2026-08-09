@@ -199,13 +199,15 @@
     // Patek/AP ref with letter suffix.
     const hasRef =
       /\b(?:1[12]\d{4}|[23]\d{5}|5\d{3}[A-Z]|W[A-Z0-9]{5,7})\b/.test(text);
-    const hasBrand =
-      /\b(?:Rolex|RLX|Patek|Audemars\s?Piguet|AP|Cartier|Hublot|Omega|Tudor|Panerai|Vacheron|Richard\s?Mille|RM|PP|VC|Bvlgari|Breguet|IWC|Lange|Daytona|Datejust|Submariner|Nautilus|Royal\s?Oak|Aquanaut)\b/i.test(
+    // Watch keyword = a brand OR a well-known model (Daytona is a Rolex
+    // model, Nautilus is Patek, Royal Oak is AP, etc.). Either signals
+    // that the post is about a watch. Brand inference happens later in
+    // the Python parser based on the reference number's shape.
+    const hasWatchKeyword =
+      /\b(?:Rolex|RLX|Patek|Audemars\s?Piguet|AP|Cartier|Hublot|Omega|Tudor|Panerai|Vacheron|Richard\s?Mille|RM|PP|VC|Bvlgari|Breguet|IWC|Lange|Daytona|Datejust|Submariner|GMT[- ]Master|Sky[- ]Dweller|Yacht[- ]Master|Explorer|Nautilus|Aquanaut|Calatrava|Royal\s?Oak|Offshore|Perpetual|Constellation|Speedmaster|Seamaster|Santos|Tank|Ballon|Panthere)\b/i.test(
         text
       );
-    // Need a price signal AND at least one of (ref pattern OR brand keyword).
-    // '$64,000 + label 126688' passes even without saying 'Rolex'.
-    return hasPrice && (hasRef || hasBrand);
+    return hasPrice && (hasRef || hasWatchKeyword);
   };
 
   // Is this author link inside a comments section? Walk up looking for
