@@ -224,9 +224,14 @@ def run_refresh_loop(state: State, interval_min: int, do_push: bool):
         print(f"[refresh] {n} new messages → running refresh.py --market {state.market}")
         state.new_since_refresh = 0
         try:
+            # --force is REQUIRED for live files: the export file is
+            # append-only and grows every minute. Without it, refresh.py
+            # sees the file was already loaded once, marks it 'skip', and
+            # ignores every new message added since. Dedup handles the
+            # inevitable overlap.
             subprocess.run(
                 [sys.executable, str(ROOT / "src" / "refresh.py"),
-                 "--market", state.market],
+                 "--market", state.market, "--force"],
                 cwd=ROOT, check=False,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=300,

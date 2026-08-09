@@ -16,7 +16,9 @@ MARKETS = ("hk", "eu", "wdg", "usmoda")
 # Markets whose native currency is USD (they use $ = USD, not HKD).
 # The parser routes '$' and bare 'k'/'m' amounts to price_usdt (USD-equivalent)
 # for these markets instead of the default HKD.
-USD_MARKETS = {"usmoda"}
+# WDG is European but its dealers write '$' meaning USD, not HKD — same as
+# US Moda. HK is the only market where '$' actually means HKD.
+USD_MARKETS = {"usmoda", "wdg"}
 
 
 def db_path(market: str) -> Path:
