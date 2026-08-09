@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      2.6
+// @version      2.7
 // @description  Live-captures posts from a Facebook group and POSTs to the local receiver. v2 uses author-profile-link detection since FB stopped using role='article' for posts, and strips invisible-character anti-bot obfuscation.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -27,7 +27,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] userscript v2.6 starting");
+  console.log("[US Moda] userscript v2.7 starting");
   const SERVER = "http://127.0.0.1:8766";
   const RELOAD_EVERY_MS = 4 * 60 * 1000;  // reload every 4 min for freshness
 
@@ -291,33 +291,36 @@
   const captureFrom = (root) => {
     const authors = (root || document).querySelectorAll(AUTHOR_LINK_SEL);
     scanCount++;
-    // Only log scans that see authors — silences the millions of tiny
-    // MutationObserver ticks that pass in leaf nodes.
-    if (authors.length && scanCount % 5 === 0) {
-      dbg(`scan #${scanCount}: ${authors.length} author links visible`);
-    }
-    let emptyAuthors = 0;
+    // Count reasons for skipping so we can see WHERE posts are being lost.
+    const stats = {
+      total: authors.length, alreadyCaptured: 0, emptyAuthor: 0,
+      blocklist: 0, comments: 0, noContainer: 0, pageChrome: 0,
+      sameLength: 0, notListing: 0, dup: 0, captured: 0,
+    };
     authors.forEach((authorLink) => {
-      if (captured.has(authorLink)) return;
+      if (captured.has(authorLink)) { stats.alreadyCaptured++; return; }
 
       const author = cleanText(
         authorLink.textContent ||
         authorLink.getAttribute("aria-label") ||
         ""
       ).slice(0, 100);
-      if (!author) { emptyAuthors++; return; }
+      if (!author) { stats.emptyAuthor++; return; }
       if (AUTHOR_BLOCKLIST.has(author.toLowerCase())) {
         captured.add(authorLink);  // permanent: name never changes
+        stats.blocklist++;
         return;
       }
 
       if (isInsideComments(authorLink)) {
         captured.add(authorLink);  // permanent: structural
+        stats.comments++;
         return;
       }
 
       const container = findPostContainer(authorLink);
       if (!container) {
+        stats.noContainer++;
         // Don't add to captured — container may appear as page loads more
         return;
       }
@@ -328,17 +331,19 @@
       if (looksLikePageChrome(rawText)) {
         dbg("skip page-chrome (wrong container):", author);
         captured.add(authorLink);
+        stats.pageChrome++;
         return;
       }
 
       // Skip re-scanning identical content. Recheck when text length grows
       // (e.g. after "See more" expands the post).
       const len = rawText.length;
-      if (lastLen.get(authorLink) === len) return;
+      if (lastLen.get(authorLink) === len) { stats.sameLength++; return; }
       lastLen.set(authorLink, len);
 
       const text = cleanText(rawText).slice(0, 3000);
       if (!looksLikeListing(text)) {
+        stats.notListing++;
         dbg("skip not-a-listing:", author, "len=" + len,
             "clean-len=" + text.length,
             "text:", text.slice(0, 200));
@@ -353,14 +358,23 @@
       const key = `${date}|${time}|${author}|${text.slice(0, 200)}`;
       if (seen.has(key)) {
         captured.add(authorLink);  // done — no need to rescan
+        stats.dup++;
         return;
       }
       seen.add(key);
       captured.add(authorLink);
+      stats.captured++;
       dbg("✅ CAPTURED:", author, "→", text.slice(0, 80));
       buffer.push({ date, time, sender: author, text });
       scheduleFlush();
     });
+    // Summary line so you can see the rejection distribution at a glance
+    if (stats.total > 0 &&
+        (stats.total !== stats.alreadyCaptured || scanCount % 20 === 0)) {
+      const active = { ...stats };
+      delete active.alreadyCaptured;  // usually the biggest and least useful
+      dbg(`scan #${scanCount}:`, JSON.stringify(active));
+    }
   };
 
   // ---- Auto-click "N new posts" buttons ----
