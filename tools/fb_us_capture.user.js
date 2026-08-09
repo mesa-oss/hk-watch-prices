@@ -34,6 +34,22 @@
   console.log("[US Moda] v3.6 (unsafeWindow hook + auto-scroll) starting");
   const SERVER = "http://127.0.0.1:8766";
 
+  // Force chronological sort so we see the newest listings first.
+  // FB's default is algorithmic; that means we could miss brand-new posts.
+  try {
+    const u = new URL(location.href);
+    if (
+      u.pathname.startsWith("/groups/") &&
+      !u.pathname.includes("/user/") &&
+      u.searchParams.get("sorting_setting") !== "CHRONOLOGICAL"
+    ) {
+      u.searchParams.set("sorting_setting", "CHRONOLOGICAL");
+      console.log("[US Moda] redirecting to chronological sort");
+      location.replace(u.toString());
+      return;
+    }
+  } catch (_) {}
+
   // Fall back to window if unsafeWindow isn't granted (shouldn't happen with our header)
   const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
   console.log("[US Moda] using", W === window ? "window (sandbox)" : "unsafeWindow (page)");
