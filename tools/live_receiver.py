@@ -173,9 +173,49 @@ def make_handler(state: State):
     return Handler
 
 
-def run_refresh_loop(state: State, interval_min: int):
+def _run(cmd, cwd=ROOT, timeout=90):
+    """Run a shell command and return (returncode, combined_output)."""
+    r = subprocess.run(
+        cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
+    )
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def auto_git_push(market: str) -> str | None:
+    """Commit + push the market's DB if it changed. Returns a short status
+    string for logging, or None on no-op. Silently tolerates git errors
+    (no network, auth prompt) so the receiver keeps running.
+    """
+    # Add the whole data/ dir and let git figure out which .db files changed
+    try:
+        # Anything to commit?
+        rc, _ = _run(["git", "diff", "--quiet", "--", "data/"])
+        if rc == 0:
+            return None  # nothing changed
+        rc, out = _run(["git", "add", "data/"])
+        if rc != 0:
+            return f"git add failed: {out[:120]}"
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        rc, out = _run([
+            "git", "commit", "-q", "-m",
+            f"live: {market} refresh {stamp}",
+        ])
+        if rc != 0:
+            return f"git commit failed: {out[:120]}"
+        rc, out = _run(["git", "push", "-q"], timeout=60)
+        if rc != 0:
+            return f"git push failed: {out[:120]}"
+        return "pushed"
+    except subprocess.TimeoutExpired:
+        return "git operation timed out"
+    except Exception as e:
+        return f"git error: {e}"
+
+
+def run_refresh_loop(state: State, interval_min: int, do_push: bool):
     """Background thread: run refresh.py every interval_min minutes if there
-    are new messages since the last refresh."""
+    are new messages since the last refresh, then optionally git-push so
+    Streamlit Cloud picks up the changes."""
     while True:
         time.sleep(interval_min * 60)
         if state.new_since_refresh == 0:
@@ -189,11 +229,23 @@ def run_refresh_loop(state: State, interval_min: int):
                  "--market", state.market],
                 cwd=ROOT, check=False,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=300,
             )
             state.last_refresh_at = datetime.now()
             print(f"[refresh] done at {state.last_refresh_at.strftime('%H:%M:%S')}")
         except Exception as e:
             print(f"[refresh] error: {e}")
+            continue
+
+        # Push to GitHub so the Streamlit Cloud app sees the new data
+        if do_push:
+            status = auto_git_push(state.market)
+            if status == "pushed":
+                print(f"[git] pushed at {datetime.now().strftime('%H:%M:%S')} — Streamlit will redeploy shortly")
+            elif status is None:
+                pass  # nothing to commit — silent
+            else:
+                print(f"[git] {status}")
 
 
 def main():
@@ -202,21 +254,26 @@ def main():
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--refresh-min", type=int, default=REFRESH_INTERVAL_MIN,
                     help="Auto-run refresh.py this often (min)")
+    ap.add_argument("--no-push", action="store_true",
+                    help="Skip the automatic git push after each refresh")
     args = ap.parse_args()
 
     state = State(args.market)
     handler = make_handler(state)
     server = HTTPServer(("127.0.0.1", args.port), handler)
 
+    do_push = not args.no_push
     # Background refresh loop
     t = threading.Thread(
-        target=run_refresh_loop, args=(state, args.refresh_min), daemon=True,
+        target=run_refresh_loop, args=(state, args.refresh_min, do_push),
+        daemon=True,
     )
     t.start()
 
     print(f"[receiver] listening on http://127.0.0.1:{args.port}")
     print(f"[receiver] market={args.market}  writing to {state.out_file}")
-    print(f"[receiver] auto-refresh every {args.refresh_min} min")
+    print(f"[receiver] auto-refresh every {args.refresh_min} min"
+          f"{' + git push' if do_push else ' (no auto-push)'}")
     print(f"[receiver] status: http://127.0.0.1:{args.port}/status")
     print(f"[receiver] Ctrl+C to stop\n")
     try:
