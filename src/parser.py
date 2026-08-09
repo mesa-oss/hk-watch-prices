@@ -86,6 +86,8 @@ REFERENCE_PATTERNS = [
     # "Rolex" nearby so we don't grab random 4-digit numbers as refs.
     # Year-shape rejects (19xx/20xx) still applied via extract_reference.
     re.compile(r"\bRolex\s+(\d{4})\b(?!\d|[A-Za-z/])", re.I),
+    re.compile(r"\bRolex\s+(\d{5})\b(?![A-Za-z0-9])", re.I),
+    re.compile(r"\bCartier\s+(\d{4})\b(?![A-Za-z0-9])", re.I),
     # Rolex: 126234, 126503, 116503, 336938, 277200, 116505-0001
     re.compile(r"\b(1\d{5}[A-Z]{0,5}(?:-\d{4})?)\b", re.I),
     re.compile(r"\b(2\d{5}[A-Z]{0,5}(?:-\d{4})?)\b", re.I),
@@ -179,7 +181,7 @@ def infer_brand(reference: str, message_context: str = "") -> str | None:
     # AP shorthand: 26240OR, 15510ST, 77450BC, 16202BA — distinctive 5-digit + 2 letters
     # (must come before context hints, since one message can mix brands)
     if re.match(
-        r"^(?:152|154|155|158|162|167|172|252|258|259|262|263|264|265|266|267|268|274|275|276|277|484|664|774|775|774)\d{2}[A-Z]{2}",
+        r"^(?:152|154|155|158|162|167|172|252|258|259|260|261|262|263|264|265|266|267|268|269|274|275|276|277|484|664|774|775)\d{2}[A-Z]{2}",
         ref,
     ):
         return "Audemars Piguet"
@@ -359,6 +361,10 @@ def _extract_eur(line: str) -> int | None:
         re.compile(r"(\d{1,2}\.\d{1,3})\s*€(?!\s*[kKmM])"),
         re.compile(r"EUR\s*(\d{1,2}\.\d{1,3})\b(?!\s*[kKmM])", re.I),
         re.compile(r"(\d{1,2}\.\d{1,3})\s*(?:EUR|EURO|EUROS)\b(?!\s*[kKmM])", re.I),
+        re.compile(r"€\s*(\d{1,2})(?![\d.,kKmM])"),
+        re.compile(r"(\d{1,2})\s*€(?![kKmM])"),
+        re.compile(r"EUR\s+(\d{1,2})\b(?![\d.,kKmM])", re.I),
+        re.compile(r"(\d{1,2})\s+(?:EUR|EURO|EUROS)\b(?![kKmM])", re.I),
         # Comma-as-decimal (EU convention): €24,5 = 24,500. Restricted
         # to 1-2 digits after the comma so we don't collide with the
         # English thousands separator handled by the existing patterns.
