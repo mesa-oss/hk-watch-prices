@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      2.9
-// @description  Live-captures posts from a Facebook group and POSTs to the local receiver. v2 uses author-profile-link detection since FB stopped using role='article' for posts, and strips invisible-character anti-bot obfuscation.
+// @version      3.0
+// @description  Intercepts Facebook's GraphQL responses (the same JSON their own UI reads) to capture Watchtrading posts, then POSTs to the local receiver. No DOM parsing — hooks fetch/XHR at document-start.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
 // @match        https://m.facebook.com/groups/*
@@ -10,33 +10,100 @@
 // @grant        GM.xmlHttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 /*
-   SETUP (once):
+   HOW THIS WORKS (v3.0 — total rewrite)
+   =====================================
+
+   The DOM-based approach (v2.x) failed because FB obfuscates class names,
+   removes role="article" markers, hides text behind "See more", and
+   nests posts inside indistinguishable divs. Every version we patched,
+   FB's chrome would leak in.
+
+   v3.0 skips the DOM entirely. FB's own React UI reads posts by calling
+   /api/graphql/ endpoints — those responses contain the full post as
+   structured JSON: author name, message text, creation time. We
+   monkey-patch window.fetch and XMLHttpRequest to intercept the raw
+   responses BEFORE FB's UI code sees them, walk the JSON tree for
+   post-shaped objects, and forward them to the local receiver.
+
+   This is how commercial FB scrapers work. It's resistant to:
+   - HTML class-name obfuscation (we never look at HTML)
+   - "See more" truncation (JSON always has full text)
+   - Invisible-char anti-bot (that's DOM-only obfuscation)
+   - Layout changes (as long as the GraphQL shape stays roughly similar)
+
+   Setup:
      1. Tampermonkey icon → Create new script → paste this file → save (⌘S).
-     2. In another Terminal:
+     2. Terminal:
           cd ~/Projects/hk-watch-prices
           ./tools/live_start_usmoda.sh
-     3. Open the FB group in Chrome — badge appears bottom-right, capture is
-        automatic. Auto-reloads every 10 min to keep the feed fresh (FB
-        doesn't push new posts like WhatsApp does).
+     3. Reload the FB group tab (⌘⇧R). Badge appears bottom-right.
+        Scroll to load posts; each new response is intercepted and sent.
 */
 
 (function () {
   "use strict";
 
-  console.log("[US Moda] userscript v2.9 starting");
+  console.log("[US Moda] v3.0 (GraphQL intercept) starting");
   const SERVER = "http://127.0.0.1:8766";
-  const RELOAD_EVERY_MS = 4 * 60 * 1000;  // reload every 4 min for freshness
 
+  // ---------- GraphQL interception ----------
+  //
+  // FB's UI fetches feed data via /api/graphql/ (also /ajax/bulk-route-definitions/
+  // and similar). Responses are usually multi-line: each line is one JSON
+  // "payload chunk" (FB uses HTTP streaming for progressive feed load).
+  // Some responses start with `for (;;);` as a CSRF anti-hijack prefix
+  // that must be stripped.
+
+  const seen = new Set();       // dedup by post-id or (author|text-hash)
+  const buffer = [];
+  let flushTimer = null;
+  let sent = 0;
+  let failed = 0;
+  let serverAlive = false;
+  let interceptedRequests = 0;
+  let extractedPosts = 0;
+
+  // ---------- Badge ----------
+  let badge;
+  const buildBadge = () => {
+    if (badge) return;
+    badge = document.createElement("div");
+    badge.style.cssText = `
+      position:fixed; bottom:12px; right:12px; z-index:2147483647;
+      background:#111; color:#fff; padding:8px 12px; border-radius:8px;
+      font:12px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;
+      box-shadow:0 4px 12px rgba(0,0,0,.3); user-select:none;
+      transition:background .3s;
+    `;
+    badge.textContent = "🟡 US Moda v3 starting…";
+    if (document.body) document.body.appendChild(badge);
+  };
+  const updateBadge = () => {
+    if (!badge) return;
+    const dot = serverAlive ? "🟢" : "🔴";
+    badge.textContent =
+      `${dot} US Moda v3 · ${sent} sent · ${extractedPosts} found · ${interceptedRequests} req`;
+    if (failed) badge.textContent += ` · ${failed} failed`;
+    badge.style.background = serverAlive ? "#0a3" : (interceptedRequests > 0 ? "#c60" : "#a00");
+  };
+  // Attach badge as soon as body exists
+  const attachBadgeWhenReady = () => {
+    if (document.body) { buildBadge(); updateBadge(); return; }
+    setTimeout(attachBadgeWhenReady, 100);
+  };
+  attachBadgeWhenReady();
+
+  // ---------- Sender ----------
   const gmRequest = (opts) =>
     new Promise((resolve, reject) => {
       const fn =
         typeof GM_xmlhttpRequest !== "undefined"
           ? GM_xmlhttpRequest
-          : GM && GM.xmlHttpRequest;
+          : (typeof GM !== "undefined" && GM.xmlHttpRequest);
       if (!fn) return reject(new Error("no GM_xmlhttpRequest"));
       fn(
         Object.assign({}, opts, {
@@ -50,45 +117,6 @@
       );
     });
 
-  if (window.__usmoda_capture_active) return;
-  window.__usmoda_capture_active = true;
-
-  const seen = new Set();
-  const buffer = [];
-  let flushTimer = null;
-  let sent = 0;
-  let failed = 0;
-  let serverAlive = false;
-  let lastReloadAt = Date.now();
-
-  // ---- Badge ----
-  const badge = document.createElement("div");
-  badge.style.cssText = `
-    position:fixed; bottom:12px; right:12px; z-index:2147483647;
-    background:#111; color:#fff; padding:8px 12px; border-radius:8px;
-    font:12px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;
-    box-shadow:0 4px 12px rgba(0,0,0,.3); user-select:none;
-    transition:background .3s;
-  `;
-  badge.textContent = "🟡 US Moda starting…";
-  const attach = () => {
-    if (document.body && !badge.isConnected) document.body.appendChild(badge);
-  };
-  attach();
-  const updateBadge = () => {
-    attach();
-    const dot = serverAlive ? "🟢" : "🔴";
-    const status = serverAlive ? "Live" : "Server offline";
-    const nextReloadMin = Math.max(
-      0,
-      Math.round((RELOAD_EVERY_MS - (Date.now() - lastReloadAt)) / 60000)
-    );
-    badge.textContent = `${dot} US Moda · ${status} · ${sent.toLocaleString()} sent · reload in ${nextReloadMin}m`;
-    if (failed) badge.textContent += ` · ${failed} failed`;
-    badge.style.background = serverAlive ? "#0a3" : "#a00";
-  };
-
-  // ---- POST batching ----
   const flush = async () => {
     flushTimer = null;
     if (!buffer.length) return;
@@ -103,460 +131,207 @@
       });
       sent += batch.length;
       serverAlive = true;
-      updateBadge();
     } catch (e) {
       failed += batch.length;
       serverAlive = false;
+      // Put back at front so we retry on next flush
       buffer.unshift(...batch);
-      updateBadge();
     }
+    updateBadge();
   };
   const scheduleFlush = () => {
-    if (!flushTimer) flushTimer = setTimeout(flush, 800);
+    if (!flushTimer) flushTimer = setTimeout(flush, 1000);
   };
 
-  // ---- FB text cleaning ----
-  // Facebook inserts U+034F (Combining Grapheme Joiner) and other invisible
-  // chars into text as anti-bot obfuscation. We truncate at the first
-  // invisible char (everything after is garbage) and strip any strays.
-  // Using explicit \uXXXX escapes — inline invisible chars can be parsed
-  // ambiguously in a regex character class and silently break the script.
-  const INVISIBLE_RE = /[\u034F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/;
-  const INVISIBLE_STRIP = /[\u034F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
-  const cleanText = (s) => {
-    if (!s) return "";
-    const cutIdx = s.search(INVISIBLE_RE);
-    const truncated = cutIdx >= 0 ? s.slice(0, cutIdx) : s;
-    return truncated.replace(INVISIBLE_STRIP, "").trim();
-  };
-
-  // ---- Post extraction via author-link anchoring ----
+  // ---------- Post extraction ----------
   //
-  // Each post has an author profile link `/groups/{GID}/user/{UID}/`. We
-  // walk UP from that anchor to find the post container (a div that also
-  // holds the post's body text and timestamp link). Much more robust than
-  // relying on role="article" or randomized class names.
-  const AUTHOR_LINK_SEL = 'a[href*="/groups/"][href*="/user/"]';
+  // FB's GraphQL objects for feed stories vary but share consistent
+  // fields. We walk the JSON tree and pick out anything that looks like
+  // a story with an author name and message text.
+  const emit = (author, text, tsSec, postId) => {
+    if (!author || !text) return;
+    text = String(text).trim();
+    if (text.length < 20) return;                  // too short to be a listing
+    author = String(author).trim().slice(0, 100);
+    if (!author) return;
 
-  const findPostContainer = (authorLink) => {
-    // Pass 1: look for FB's real post markers. These are the correct
-    // boundary of a post; text-based heuristics can overshoot into the
-    // page shell (left sidebar → "Facebook" repeats + huge innerText).
-    let node = authorLink.parentElement;
-    for (let i = 0; i < 20 && node && node !== document.body; i++) {
-      const role = node.getAttribute?.("role");
-      const pagelet = node.getAttribute?.("data-pagelet") || "";
-      // Stop if we're about to walk into the feed shell — the parent of
-      // articles is role="feed" or role="main"; walking through it lands
-      // in the page chrome with 20k+ chars including sidebar.
-      if (role === "feed" || role === "main") return null;
-      if (
-        role === "article" ||
-        pagelet.startsWith("FeedUnit") ||
-        pagelet.startsWith("GroupFeed") ||
-        pagelet.startsWith("Feed")
-      ) {
-        return node;
-      }
-      node = node.parentElement;
-    }
-    // Pass 2: text-heuristic fallback. Upper bound raised to 20k because
-    // posts with comments expanded can easily hit 5-8k chars, and we now
-    // rely on the feed/main stop above to prevent grabbing page shell.
-    node = authorLink.parentElement;
-    for (let i = 0; i < 12 && node && node !== document.body; i++) {
-      const role = node.getAttribute?.("role");
-      if (role === "feed" || role === "main") return null;
-      const t = node.innerText || "";
-      const hasTs = node.querySelector(
-        'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"], a[aria-label*="ago"]'
-      );
-      if (t.length > 60 && t.length < 20000 && hasTs) return node;
-      node = node.parentElement;
-    }
-    return null;
+    const key = postId || `${author}|${text.slice(0, 120)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    extractedPosts++;
+
+    const d = tsSec ? new Date(tsSec * 1000) : new Date();
+    const two = (n) => String(n).padStart(2, "0");
+    const date = `${two(d.getDate())}/${two(d.getMonth() + 1)}/${d.getFullYear()}`;
+    const time = `${two(d.getHours())}:${two(d.getMinutes())}`;
+
+    buffer.push({ date, time, sender: author, text });
+    scheduleFlush();
+    console.log("[US Moda] ✅ extracted:", author, "→", text.slice(0, 80));
   };
 
-  // WeakSet of post containers we already captured. Each post has 2+
-  // author links (avatar link + name link, same href, different DOM
-  // nodes). Dedup at the container level so we process each post once.
-  const processedContainers = new WeakSet();
-
-  // Detect "this is page chrome, not a post" — the FB left sidebar has
-  // 15+ repetitions of "Facebook" as accessibility labels for recent
-  // groups. A real dealer post never has that pattern.
-  const looksLikePageChrome = (text) => {
-    const lines = text.split(/\n+/).slice(0, 30);
-    let fbCount = 0;
-    for (const l of lines) if (l.trim() === "Facebook") fbCount++;
-    return fbCount >= 3;
-  };
-
-  const extractTimestamp = (container) => {
-    // Try multiple approaches — FB uses different formats in different contexts
-    for (const a of container.querySelectorAll(
-      'a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid"]'
-    )) {
-      const label = a.getAttribute("aria-label");
-      if (label) {
-        const d = new Date(label);
-        if (!isNaN(d)) return d;
-      }
-      const abbr = a.querySelector("abbr");
-      const title = abbr?.getAttribute("title");
-      if (title) {
-        const d = new Date(title);
-        if (!isNaN(d)) return d;
-      }
-    }
-    // Last resort: relative-time text like "5 min", "2 hr", "3d"
-    const rel = container.querySelector('a[role="link"] span, span[dir="auto"]');
-    // Just fall back to now — better than dropping the post
-    return new Date();
-  };
-
-  const two = (n) => String(n).padStart(2, "0");
-  const captured = new WeakSet();  // successfully-sent posts: never retry
-  // Cache last-seen text length per author-link. If length grows (e.g. after
-  // "See more" expansion), re-attempt the capture. Skips re-scanning stable
-  // posts on every MutationObserver tick.
-  const lastLen = new WeakMap();
-
-  // Click "See more" buttons to expand truncated post text. FB truncates
-  // long posts and hides the rest behind a button — the ref number and
-  // price are often *inside* the hidden portion, so container.innerText
-  // returns a useless preview and looksLikeListing() rejects it. We click
-  // aggressively (every 3s) so posts self-expand as they scroll into view.
-  const SEE_MORE_TEXTS = new Set([
-    "see more", "…see more", "see more…", "... see more", "see more...",
-    "voir plus", "…voir plus", "voir plus…",  // French
-    "mehr anzeigen",                            // German
-    "ver más",                                  // Spanish
-    "altro",                                    // Italian
-  ]);
-  const expandAllSeeMore = () => {
-    let n = 0;
-    for (const el of document.querySelectorAll(
-      'div[role="button"], span[role="button"]'
-    )) {
-      if (!el.offsetParent) continue;  // must be visible
-      const t = (el.textContent || "").trim().toLowerCase();
-      if (SEE_MORE_TEXTS.has(t)) {
-        try { el.click(); n++; } catch (_) {}
-      }
-    }
-    if (n) dbg(`expanded ${n} "See more"`);
-  };
-
-  // Skip these "authors" — either FB itself, generic system pages, or noise.
-  const AUTHOR_BLOCKLIST = new Set([
-    "facebook", "facebook groups", "meta", "instagram", "admin",
-    "moderator", "group admin", "anonymous participant",
-  ]);
-
-  // A post is worth capturing only if it has REAL trading content.
-  // Comments like "beautiful watch, glws" or "still available?" don't.
-  // Requires ONE strong signal (price with $ or €) plus ANY hint of
-  // watch content (ref-number pattern OR brand keyword).
-  const looksLikeListing = (text) => {
-    if (text.length < 60) return false;
-    // Explicit dealer-price signal: dollar/euro amount, or "USD 5000",
-    // or numeric+k/m (e.g. "17k"). Bare 4-6 digit numbers don't count
-    // (too many false positives — year, quantity, etc.).
-    const hasPrice =
-      /\$\s?\d{2,}|\€\s?\d{2,}|\bUSD\s?\d|\bEUR\s?\d|\d+\s?[kKmM]\b/i.test(text);
-    // Any of: 5-6 digit Rolex-shape ref, W-prefixed Cartier ref, 4-digit
-    // Patek/AP ref with letter suffix.
-    const hasRef =
-      /\b(?:1[12]\d{4}|[23]\d{5}|5\d{3}[A-Z]|W[A-Z0-9]{5,7})\b/.test(text);
-    // Watch keyword = a brand OR a well-known model (Daytona is a Rolex
-    // model, Nautilus is Patek, Royal Oak is AP, etc.). Either signals
-    // that the post is about a watch. Brand inference happens later in
-    // the Python parser based on the reference number's shape.
-    const hasWatchKeyword =
-      /\b(?:Rolex|RLX|Patek|Audemars\s?Piguet|AP|Cartier|Hublot|Omega|Tudor|Panerai|Vacheron|Richard\s?Mille|RM|PP|VC|Bvlgari|Breguet|IWC|Lange|Daytona|Datejust|Submariner|GMT[- ]Master|Sky[- ]Dweller|Yacht[- ]Master|Explorer|Nautilus|Aquanaut|Calatrava|Royal\s?Oak|Offshore|Perpetual|Constellation|Speedmaster|Seamaster|Santos|Tank|Ballon|Panthere)\b/i.test(
-        text
-      );
-    return hasPrice && (hasRef || hasWatchKeyword);
-  };
-
-  // Is this author link inside a comments section? Walk up looking for
-  // comment-container markers.
-  const isInsideComments = (el) => {
-    let node = el;
-    for (let i = 0; i < 15 && node && node !== document.body; i++) {
-      const aria = (node.getAttribute("aria-label") || "").toLowerCase();
-      if (aria.includes("comment")) return true;
-      if (node.tagName === "UL") return true;   // FB renders comments as list items
-      node = node.parentElement;
-    }
-    return false;
-  };
-
-  // Toggle DEBUG=true to log every decision to console. Helps see WHY
-  // real posts are being rejected. Turn off once filter is tuned.
-  const DEBUG = true;
-  const dbg = (...args) => { if (DEBUG) console.log("[US Moda]", ...args); };
-
-  // ---- DOM inspection helper (call from console) ----
+  // Recursively walk an object looking for post-shaped nodes.
   //
-  // Usage in DevTools console:
-  //   __usmoda_dump()            — inspect first author link's ancestor chain
-  //   __usmoda_dump(3)           — inspect 4th author link (0-indexed)
-  //   __usmoda_dump("Sebastien") — inspect the first link whose author text contains "Sebastien"
+  // FB feed stories typically have SOME combination of these fields
+  // (the shape varies by response type — comet_sections vs actors vs
+  // owning_profile — so we accept any that carries a message + name):
   //
-  // Prints a table of every ancestor: tag, role, data-pagelet, data-testid,
-  // class, innerText length, first 60 chars of preview. Use this output to
-  // pick the RIGHT container marker (instead of guessing role="article").
-  window.__usmoda_dump = (target = 0) => {
-    const links = Array.from(document.querySelectorAll(AUTHOR_LINK_SEL));
-    let link;
-    if (typeof target === "string") {
-      link = links.find((l) =>
-        ((l.textContent || l.getAttribute("aria-label") || "")
-          .toLowerCase()
-          .includes(target.toLowerCase()))
-      );
-    } else {
-      link = links[target];
-    }
-    if (!link) {
-      console.log(`[dump] no link found for target=${target}. Have ${links.length} links.`);
-      return;
-    }
-    console.log("[dump] link:", link.href, "text:", (link.textContent||"").slice(0,60));
-    const chain = [];
-    let node = link;
-    for (let i = 0; i < 25 && node && node !== document.body; i++) {
-      const cls = (node.className || "").toString().slice(0, 40);
-      chain.push({
-        depth: i,
-        tag: node.tagName,
-        role: node.getAttribute?.("role") || "",
-        pagelet: node.getAttribute?.("data-pagelet") || "",
-        testid: node.getAttribute?.("data-testid") || "",
-        ariaLbl: (node.getAttribute?.("aria-label") || "").slice(0, 30),
-        cls,
-        textLen: (node.innerText || "").length,
-        preview: (node.innerText || "").slice(0, 60).replace(/\n/g, "⏎"),
-      });
-      node = node.parentElement;
-    }
-    console.table(chain);
-    return chain;
-  };
-  console.log("[US Moda] DEBUG: run __usmoda_dump() in console to inspect DOM");
+  //   creation_time (unix seconds)
+  //   id | post_id | story_bucket_id (post identifier)
+  //   message: { text: string }              — the post body
+  //   message_preferred_body: { text: ... }  — sometimes here instead
+  //   actors: [{ name: string }]             — the author
+  //   comet_sections: { context_layout: { story: { actors: [{name}] } } }
+  //   comet_sections: { content: { story: { message: { text } } } }
+  //
+  // We look at every object in the tree, extract whatever we can find,
+  // and if we get both an author name AND message text, we emit.
+  const walkForPosts = (obj) => {
+    const stack = [obj];
+    let depth = 0;
+    while (stack.length && depth < 5000) {
+      depth++;
+      const node = stack.pop();
+      if (!node || typeof node !== "object") continue;
 
-  let scanCount = 0;
-  const captureFrom = (root) => {
-    const authors = (root || document).querySelectorAll(AUTHOR_LINK_SEL);
-    scanCount++;
-    // Count reasons for skipping so we can see WHERE posts are being lost.
-    const stats = {
-      total: authors.length, alreadyCaptured: 0, emptyAuthor: 0,
-      blocklist: 0, comments: 0, noContainer: 0, pageChrome: 0,
-      sameLength: 0, notListing: 0, dup: 0, captured: 0,
+      // Try to extract post fields from this node
+      const author =
+        node?.actors?.[0]?.name ||
+        node?.owning_profile?.name ||
+        node?.author?.name ||
+        node?.from?.name ||
+        node?.comet_sections?.context_layout?.story?.actors?.[0]?.name ||
+        null;
+
+      const text =
+        node?.message?.text ||
+        node?.message_preferred_body?.text ||
+        node?.body?.text ||
+        node?.comet_sections?.content?.story?.message?.text ||
+        node?.comet_sections?.message?.story?.message?.text ||
+        null;
+
+      const time =
+        node?.creation_time ||
+        node?.created_time ||
+        node?.comet_sections?.context_layout?.story?.creation_time ||
+        null;
+
+      const id =
+        node?.post_id ||
+        node?.id ||
+        node?.story_bucket_id ||
+        null;
+
+      if (author && text) {
+        emit(author, text, time, id);
+      }
+
+      // Recurse into children (arrays and object values)
+      if (Array.isArray(node)) {
+        for (const item of node) stack.push(item);
+      } else {
+        for (const val of Object.values(node)) {
+          if (val && typeof val === "object") stack.push(val);
+        }
+      }
+    }
+  };
+
+  // Parse a raw GraphQL response body. FB sends multi-line JSON,
+  // sometimes with a `for (;;);` CSRF prefix.
+  const parseResponseBody = (body) => {
+    if (!body || typeof body !== "string") return;
+    // Strip CSRF prefix if present
+    if (body.startsWith("for (;;);")) body = body.slice(9);
+    if (body.startsWith(")]}'")) body = body.slice(4);
+
+    // Multi-line JSON: try each line
+    for (const line of body.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{")) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        walkForPosts(obj);
+      } catch (_) {
+        // Not JSON — skip
+      }
+    }
+    // Also try parsing whole body as one JSON (some responses are single-payload)
+    try {
+      const obj = JSON.parse(body);
+      walkForPosts(obj);
+    } catch (_) {}
+  };
+
+  const shouldIntercept = (url) => {
+    if (!url || typeof url !== "string") return false;
+    return (
+      url.includes("/api/graphql/") ||
+      url.includes("/graphql/") ||
+      url.includes("bulk-route-definitions")
+    );
+  };
+
+  // ---------- Monkey-patch fetch ----------
+  const origFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const url =
+      typeof input === "string" ? input :
+      (input && input.url) ? input.url : "";
+    const promise = origFetch.apply(this, arguments);
+    if (shouldIntercept(url)) {
+      interceptedRequests++;
+      promise
+        .then((response) => {
+          response.clone().text()
+            .then(parseResponseBody)
+            .catch(() => {});
+        })
+        .catch(() => {});
+      updateBadge();
+    }
+    return promise;
+  };
+
+  // ---------- Monkey-patch XMLHttpRequest ----------
+  const OrigXHR = window.XMLHttpRequest;
+  function PatchedXHR() {
+    const xhr = new OrigXHR();
+    let interceptThis = false;
+    const origOpen = xhr.open;
+    xhr.open = function (method, url) {
+      interceptThis = shouldIntercept(url);
+      return origOpen.apply(xhr, arguments);
     };
-    authors.forEach((authorLink) => {
-      if (captured.has(authorLink)) { stats.alreadyCaptured++; return; }
-
-      const author = cleanText(
-        authorLink.textContent ||
-        authorLink.getAttribute("aria-label") ||
-        ""
-      ).slice(0, 100);
-      // Empty-author case = avatar link. Don't reject — find the sibling
-      // name link with same href and use its text. Every post has both
-      // an avatar (<a><img></a>) and a name (<a>Name</a>) link to the
-      // same profile URL. Container dedup below prevents double-processing.
-      let effectiveAuthor = author;
-      if (!effectiveAuthor) {
-        const sameHrefLinks = document.querySelectorAll(
-          `a[href="${authorLink.getAttribute("href")}"]`
-        );
-        for (const l of sameHrefLinks) {
-          const t = cleanText(l.textContent || "").slice(0, 100);
-          if (t) { effectiveAuthor = t; break; }
-        }
-      }
-      if (!effectiveAuthor) { stats.emptyAuthor++; return; }
-
-      if (AUTHOR_BLOCKLIST.has(effectiveAuthor.toLowerCase())) {
-        captured.add(authorLink);  // permanent: name never changes
-        stats.blocklist++;
-        return;
-      }
-
-      if (isInsideComments(authorLink)) {
-        captured.add(authorLink);  // permanent: structural
-        stats.comments++;
-        return;
-      }
-
-      const container = findPostContainer(authorLink);
-      if (!container) {
-        stats.noContainer++;
-        // Don't add to captured — container may appear as page loads more
-        return;
-      }
-
-      // Avatar link + name link map to the same container. If we've
-      // already processed this container, skip silently.
-      if (processedContainers.has(container)) {
-        captured.add(authorLink);
-        return;
-      }
-
-      const rawText = container.innerText || "";
-      // Sidebar chrome sanity check: if we grabbed page shell, drop it
-      // permanently for this authorLink so we don't spam retries.
-      if (looksLikePageChrome(rawText)) {
-        dbg("skip page-chrome (wrong container):", effectiveAuthor);
-        captured.add(authorLink);
-        stats.pageChrome++;
-        return;
-      }
-
-      // Skip re-scanning identical content. Recheck when text length grows
-      // (e.g. after "See more" expands the post).
-      const len = rawText.length;
-      if (lastLen.get(authorLink) === len) { stats.sameLength++; return; }
-      lastLen.set(authorLink, len);
-
-      const text = cleanText(rawText).slice(0, 3000);
-      if (!looksLikeListing(text)) {
-        stats.notListing++;
-        dbg("skip not-a-listing:", effectiveAuthor, "len=" + len,
-            "clean-len=" + text.length,
-            "text:", text.slice(0, 200));
-        // Don't add to captured — text may expand and pass later
-        return;
-      }
-
-      const ts = extractTimestamp(container);
-      const date = `${two(ts.getDate())}/${two(ts.getMonth() + 1)}/${ts.getFullYear()}`;
-      const time = `${two(ts.getHours())}:${two(ts.getMinutes())}`;
-
-      const key = `${date}|${time}|${effectiveAuthor}|${text.slice(0, 200)}`;
-      if (seen.has(key)) {
-        captured.add(authorLink);  // done — no need to rescan
-        processedContainers.add(container);
-        stats.dup++;
-        return;
-      }
-      seen.add(key);
-      captured.add(authorLink);
-      processedContainers.add(container);
-      stats.captured++;
-      dbg("✅ CAPTURED:", effectiveAuthor, "→", text.slice(0, 80));
-      buffer.push({ date, time, sender: effectiveAuthor, text });
-      scheduleFlush();
-    });
-    // Summary line so you can see the rejection distribution at a glance
-    if (stats.total > 0 &&
-        (stats.total !== stats.alreadyCaptured || scanCount % 20 === 0)) {
-      const active = { ...stats };
-      delete active.alreadyCaptured;  // usually the biggest and least useful
-      dbg(`scan #${scanCount}:`, JSON.stringify(active));
-    }
-  };
-
-  // ---- Auto-click "N new posts" buttons ----
-  const clickNewPostsButtons = () => {
-    for (const el of document.querySelectorAll(
-      'div[role="button"], span[role="button"], button'
-    )) {
-      const t = (el.textContent || "").toLowerCase();
-      if (
-        (t.includes("new post") ||
-          t.includes("new activit") ||
-          t.match(/^see \d+ new/) ||
-          t === "new posts") &&
-        el.offsetParent !== null
-      ) {
-        el.click();
-        return true;
-      }
-    }
-    return false;
-  };
-
-  // ---- Bootstrap ----
-  const bootstrap = () => {
-    // Force CHRONOLOGICAL sort on initial load so FB doesn't show algorithmic feed
-    const url0 = new URL(location.href);
-    if (
-      url0.searchParams.get("sorting_setting") !== "CHRONOLOGICAL" &&
-      /\/groups\/[^/]+\/?$/.test(url0.pathname)
-    ) {
-      url0.searchParams.set("sorting_setting", "CHRONOLOGICAL");
-      console.log("US Moda: redirecting to CHRONOLOGICAL sort");
-      location.replace(url0.toString());
-      return;
-    }
-
-    captureFrom(null);
-
-    const observer = new MutationObserver((muts) => {
-      for (const mu of muts) {
-        for (const n of mu.addedNodes) {
-          if (n.nodeType === 1) captureFrom(n);
-        }
+    xhr.addEventListener("load", () => {
+      if (interceptThis) {
+        interceptedRequests++;
+        try {
+          parseResponseBody(xhr.responseText);
+        } catch (_) {}
+        updateBadge();
       }
     });
-    observer.observe(document.body, { childList: true, subtree: true });
+    return xhr;
+  }
+  PatchedXHR.prototype = OrigXHR.prototype;
+  window.XMLHttpRequest = PatchedXHR;
 
-    // Retry stuck items every 30s
-    setInterval(() => { if (buffer.length) flush(); }, 30_000);
-
-    // Health-check server every 60s
-    setInterval(async () => {
-      try {
-        await gmRequest({ method: "GET", url: `${SERVER}/status`, timeout: 5000 });
-        serverAlive = true;
-      } catch { serverAlive = false; }
-      updateBadge();
-    }, 60_000);
-
-    // Auto-click "new posts" every 30s
-    setInterval(() => { clickNewPostsButtons(); }, 30_000);
-
-    // Auto-expand truncated posts every 3s — the ref/price are almost
-    // always inside the "See more" portion of long dealer posts.
-    setInterval(expandAllSeeMore, 3_000);
-    // Also do a first-pass expansion right at bootstrap
-    setTimeout(expandAllSeeMore, 1_500);
-
-    // Periodic full-page rescan. MutationObserver only sees NEW nodes;
-    // if the initial bootstrap ran before FB rendered posts, or if some
-    // posts came in via a batch mutation we processed but rejected, this
-    // is a safety net that reprocesses everything.
-    setInterval(() => {
-      const total = document.querySelectorAll(AUTHOR_LINK_SEL).length;
-      dbg(`periodic rescan: ${total} total author links on page`);
-      captureFrom(null);
-    }, 10_000);
-
-    // Periodic full-page reload as fallback for stale feed
-    setInterval(() => {
-      if (Date.now() - lastReloadAt >= RELOAD_EVERY_MS && buffer.length === 0) {
-        const url = new URL(location.href);
-        url.searchParams.set("sorting_setting", "CHRONOLOGICAL");
-        location.replace(url.toString());
-      }
-      updateBadge();
-    }, 30_000);
-
-    // Initial server ping
-    (async () => {
-      try {
-        await gmRequest({ method: "GET", url: `${SERVER}/status`, timeout: 3000 });
-        serverAlive = true;
-      } catch { serverAlive = false; }
-      updateBadge();
-    })();
+  // ---------- Server health check ----------
+  const pingServer = async () => {
+    try {
+      await gmRequest({ method: "GET", url: `${SERVER}/status`, timeout: 3000 });
+      serverAlive = true;
+    } catch { serverAlive = false; }
+    updateBadge();
   };
+  setInterval(pingServer, 30_000);
+  setTimeout(pingServer, 500);
 
-  if (document.body) bootstrap();
-  else window.addEventListener("DOMContentLoaded", bootstrap);
+  // Retry stuck buffer items every 30s
+  setInterval(() => { if (buffer.length) flush(); }, 30_000);
+  setInterval(updateBadge, 5_000);
+
+  console.log("[US Moda] fetch + XHR hooks installed. Scroll the group to load posts.");
 })();
