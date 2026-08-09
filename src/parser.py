@@ -329,15 +329,15 @@ def _extract_eur(line: str) -> int | None:
     # 1) k/m suffix forms first — unambiguous once you see the k or m.
     # "€10.3k" → 10300, "€1.5m" → 1500000.
     for pat in [
-        re.compile(r"€\s*(\d+(?:\.\d+)?)\s*([kKmM]|mil)\b"),
-        re.compile(r"(\d+(?:\.\d+)?)\s*([kKmM]|mil)\s*€"),
-        re.compile(r"EUR\s*(\d+(?:\.\d+)?)\s*([kKmM]|mil)\b", re.I),
+        re.compile(r"€\s*(\d+(?:[\.,]\d+)?)\s*([kKmM]|mil)\b"),
+        re.compile(r"(\d+(?:[\.,]\d+)?)\s*([kKmM]|mil)\s*€"),
+        re.compile(r"EUR\s*(\d+(?:[\.,]\d+)?)\s*([kKmM]|mil)\b", re.I),
         re.compile(r"(\d+(?:\.\d+)?)\s*([kKmM]|mil)\s*(?:EUR|EURO|EUROS)\b", re.I),
     ]:
         m = pat.search(line)
         if m:
             try:
-                amt = float(m.group(1))
+                amt = float(m.group(1).replace(",", "."))
             except ValueError:
                 continue
             suf = m.group(2).lower()
@@ -354,11 +354,18 @@ def _extract_eur(line: str) -> int | None:
         re.compile(r"(\d{1,2}\.\d{1,3})\s*€(?!\s*[kKmM])"),
         re.compile(r"EUR\s*(\d{1,2}\.\d{1,3})\b(?!\s*[kKmM])", re.I),
         re.compile(r"(\d{1,2}\.\d{1,3})\s*(?:EUR|EURO|EUROS)\b(?!\s*[kKmM])", re.I),
+        # Comma-as-decimal (EU convention): €24,5 = 24,500. Restricted
+        # to 1-2 digits after the comma so we don't collide with the
+        # English thousands separator handled by the existing patterns.
+        re.compile(r"€\s*(\d{1,2},\d{1,2})(?![\d kKmM])"),
+        re.compile(r"(\d{1,2},\d{1,2})\s*€(?!\s*[kKmM])"),
+        re.compile(r"EUR\s*(\d{1,2},\d{1,2})\b(?!\s*[kKmM])", re.I),
+        re.compile(r"(\d{1,2},\d{1,2})\s*(?:EUR|EURO|EUROS)\b(?!\s*[kKmM])", re.I),
     ]:
         m = pat.search(line)
         if m:
             try:
-                amt = float(m.group(1)) * 1_000
+                amt = float(m.group(1).replace(",", ".")) * 1_000
             except ValueError:
                 continue
             if 500 <= amt <= 20_000_000:
