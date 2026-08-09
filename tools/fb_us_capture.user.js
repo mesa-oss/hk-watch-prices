@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      2.5
+// @version      2.6
 // @description  Live-captures posts from a Facebook group and POSTs to the local receiver. v2 uses author-profile-link detection since FB stopped using role='article' for posts, and strips invisible-character anti-bot obfuscation.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -27,7 +27,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] userscript v2.5 starting");
+  console.log("[US Moda] userscript v2.6 starting");
   const SERVER = "http://127.0.0.1:8766";
   const RELOAD_EVERY_MS = 4 * 60 * 1000;  // reload every 4 min for freshness
 
@@ -287,13 +287,25 @@
   const DEBUG = true;
   const dbg = (...args) => { if (DEBUG) console.log("[US Moda]", ...args); };
 
+  let scanCount = 0;
   const captureFrom = (root) => {
     const authors = (root || document).querySelectorAll(AUTHOR_LINK_SEL);
+    scanCount++;
+    // Only log scans that see authors — silences the millions of tiny
+    // MutationObserver ticks that pass in leaf nodes.
+    if (authors.length && scanCount % 5 === 0) {
+      dbg(`scan #${scanCount}: ${authors.length} author links visible`);
+    }
+    let emptyAuthors = 0;
     authors.forEach((authorLink) => {
       if (captured.has(authorLink)) return;
 
-      const author = cleanText(authorLink.textContent).slice(0, 100);
-      if (!author) return;
+      const author = cleanText(
+        authorLink.textContent ||
+        authorLink.getAttribute("aria-label") ||
+        ""
+      ).slice(0, 100);
+      if (!author) { emptyAuthors++; return; }
       if (AUTHOR_BLOCKLIST.has(author.toLowerCase())) {
         captured.add(authorLink);  // permanent: name never changes
         return;
@@ -416,6 +428,16 @@
     setInterval(expandAllSeeMore, 3_000);
     // Also do a first-pass expansion right at bootstrap
     setTimeout(expandAllSeeMore, 1_500);
+
+    // Periodic full-page rescan. MutationObserver only sees NEW nodes;
+    // if the initial bootstrap ran before FB rendered posts, or if some
+    // posts came in via a batch mutation we processed but rejected, this
+    // is a safety net that reprocesses everything.
+    setInterval(() => {
+      const total = document.querySelectorAll(AUTHOR_LINK_SEL).length;
+      dbg(`periodic rescan: ${total} total author links on page`);
+      captureFrom(null);
+    }, 10_000);
 
     // Periodic full-page reload as fallback for stale feed
     setInterval(() => {
