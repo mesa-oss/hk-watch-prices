@@ -236,16 +236,33 @@
     // Auto-click "new posts" every 30s
     setInterval(() => { clickNewPostsButtons(); }, 30_000);
 
-    // Periodic page reload — FB fallback when the feed goes stale
+    // Periodic page reload — FB fallback when the feed goes stale.
+    // Preserves CHRONOLOGICAL sort so we don't fall back to FB's
+    // algorithmic 'Top Posts' order (which would hide fresh listings).
     setInterval(() => {
       if (Date.now() - lastReloadAt >= RELOAD_EVERY_MS) {
-        // Only reload if there's nothing waiting to flush (avoid losing captures)
         if (buffer.length === 0) {
-          location.reload();
+          const url = new URL(location.href);
+          if (url.searchParams.get("sorting_setting") !== "CHRONOLOGICAL") {
+            url.searchParams.set("sorting_setting", "CHRONOLOGICAL");
+          }
+          location.replace(url.toString());
         }
       }
       updateBadge();
     }, 30_000);
+
+    // On first load, force chronological sort if the user landed without it
+    if (new URL(location.href).searchParams.get("sorting_setting") !== "CHRONOLOGICAL") {
+      const url = new URL(location.href);
+      url.searchParams.set("sorting_setting", "CHRONOLOGICAL");
+      // Only redirect if we're on the group root (avoid post-detail pages)
+      if (/\/groups\/[^/]+\/?$/.test(url.pathname)) {
+        console.log("US Moda capture: redirecting to CHRONOLOGICAL sort");
+        location.replace(url.toString());
+        return;
+      }
+    }
 
     // Initial server check
     (async () => {
