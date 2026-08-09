@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         US Moda Facebook Group Live Capture
 // @namespace    hk-watch-prices
-// @version      2.8
+// @version      2.9
 // @description  Live-captures posts from a Facebook group and POSTs to the local receiver. v2 uses author-profile-link detection since FB stopped using role='article' for posts, and strips invisible-character anti-bot obfuscation.
 // @author       hk-watch-prices
 // @match        https://www.facebook.com/groups/*
@@ -27,7 +27,7 @@
 (function () {
   "use strict";
 
-  console.log("[US Moda] userscript v2.8 starting");
+  console.log("[US Moda] userscript v2.9 starting");
   const SERVER = "http://127.0.0.1:8766";
   const RELOAD_EVERY_MS = 4 * 60 * 1000;  // reload every 4 min for freshness
 
@@ -297,6 +297,55 @@
   // real posts are being rejected. Turn off once filter is tuned.
   const DEBUG = true;
   const dbg = (...args) => { if (DEBUG) console.log("[US Moda]", ...args); };
+
+  // ---- DOM inspection helper (call from console) ----
+  //
+  // Usage in DevTools console:
+  //   __usmoda_dump()            — inspect first author link's ancestor chain
+  //   __usmoda_dump(3)           — inspect 4th author link (0-indexed)
+  //   __usmoda_dump("Sebastien") — inspect the first link whose author text contains "Sebastien"
+  //
+  // Prints a table of every ancestor: tag, role, data-pagelet, data-testid,
+  // class, innerText length, first 60 chars of preview. Use this output to
+  // pick the RIGHT container marker (instead of guessing role="article").
+  window.__usmoda_dump = (target = 0) => {
+    const links = Array.from(document.querySelectorAll(AUTHOR_LINK_SEL));
+    let link;
+    if (typeof target === "string") {
+      link = links.find((l) =>
+        ((l.textContent || l.getAttribute("aria-label") || "")
+          .toLowerCase()
+          .includes(target.toLowerCase()))
+      );
+    } else {
+      link = links[target];
+    }
+    if (!link) {
+      console.log(`[dump] no link found for target=${target}. Have ${links.length} links.`);
+      return;
+    }
+    console.log("[dump] link:", link.href, "text:", (link.textContent||"").slice(0,60));
+    const chain = [];
+    let node = link;
+    for (let i = 0; i < 25 && node && node !== document.body; i++) {
+      const cls = (node.className || "").toString().slice(0, 40);
+      chain.push({
+        depth: i,
+        tag: node.tagName,
+        role: node.getAttribute?.("role") || "",
+        pagelet: node.getAttribute?.("data-pagelet") || "",
+        testid: node.getAttribute?.("data-testid") || "",
+        ariaLbl: (node.getAttribute?.("aria-label") || "").slice(0, 30),
+        cls,
+        textLen: (node.innerText || "").length,
+        preview: (node.innerText || "").slice(0, 60).replace(/\n/g, "⏎"),
+      });
+      node = node.parentElement;
+    }
+    console.table(chain);
+    return chain;
+  };
+  console.log("[US Moda] DEBUG: run __usmoda_dump() in console to inspect DOM");
 
   let scanCount = 0;
   const captureFrom = (root) => {
