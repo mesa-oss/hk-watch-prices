@@ -664,21 +664,21 @@ def render_deal_finder(buy_market: str, ref_market: str) -> None:
 
 
 def render_top_deals() -> None:
-    """Streamlined view for the user's main workflow: buy in Europe
-    (Reuven + WDG combined), sell in HK. Only positive-delta listings are
-    shown, sorted best-first. This is the tab she'll live in day-to-day.
+    """Streamlined view for the main workflow: buy outside HK, sell in HK.
+    Buy sources are the EU dealers (Reuven + WDG) and the US Moda FB group,
+    combined. Only positive-delta listings are shown, sorted best-first.
     """
-    # Which European sources are available? 'eu' = Reuven, 'wdg' = WDG.
-    eu_sources = [m for m in ("eu", "wdg") if m in MARKETS_AVAILABLE]
-    if "hk" not in MARKETS_AVAILABLE or not eu_sources:
+    # Every non-HK market we've loaded is a potential buy source.
+    buy_sources = [m for m in ("eu", "wdg", "usmoda") if m in MARKETS_AVAILABLE]
+    if "hk" not in MARKETS_AVAILABLE or not buy_sources:
         st.warning(
-            "Top Deals needs both HK and at least one EU database loaded. "
+            "Top Deals needs both HK and at least one buy-side database loaded. "
             f"Currently have: {', '.join(MARKETS_AVAILABLE)}"
         )
         return
 
     st.markdown(
-        "**Best EU → HK deals right now.** Only listings where the EU buy "
+        "**Best buy → HK deals right now.** Only listings where the buy-side "
         "price is at or below the cheapest same-spec HK listing. Sorted by "
         "delta % — biggest opportunity at the top."
     )
@@ -697,17 +697,19 @@ def render_top_deals() -> None:
             label_visibility="collapsed", key="td_mindelta",
         )
     with top3:
+        # "All" combines every buy source; individual entries let you pin
+        # to one market (e.g. only US Moda deals).
         source_pick = st.selectbox(
-            "EU source",
-            ["Both"] + [MARKET_LABEL[m] for m in eu_sources],
+            "Buy market",
+            ["All"] + [MARKET_LABEL[m] for m in buy_sources],
             label_visibility="collapsed", key="td_source",
         )
 
     with st.expander("More filters", expanded=False):
         f1, f2 = st.columns(2)
-        # Union of brands across all EU sources so the picker is complete
+        # Union of brands across all buy sources so the picker is complete
         brand_set: set[str] = set()
-        for m in eu_sources:
+        for m in buy_sources:
             brand_set.update(load_distinct("brand", m))
         brand = f1.selectbox("Brand", [""] + sorted(brand_set), key="td_brand")
         condition = f2.radio("Condition", ["any", "new", "used"],
@@ -728,10 +730,10 @@ def render_top_deals() -> None:
                                        key="td_year")
 
     # --- Which sources to load ---
-    load_sources = eu_sources
-    if source_pick != "Both":
+    load_sources = buy_sources
+    if source_pick != "All":
         # User picked a single source
-        load_sources = [m for m in eu_sources if MARKET_LABEL[m] == source_pick]
+        load_sources = [m for m in buy_sources if MARKET_LABEL[m] == source_pick]
 
     # --- Build the shared WHERE clause (applied to each EU source) ---
     where = ["1=1"]
@@ -793,7 +795,7 @@ def render_top_deals() -> None:
     buy_df = pd.concat(buy_parts, ignore_index=True) if buy_parts else pd.DataFrame()
 
     if not len(buy_df):
-        st.info("No EU listings match those filters.")
+        st.info("No buy-side listings match those filters.")
         return
 
     buy_df["buy_usd"] = buy_df.apply(
@@ -807,7 +809,7 @@ def render_top_deals() -> None:
     ].copy()
 
     if not len(buy_df):
-        st.info("EU listings found but none had a parseable price.")
+        st.info("Buy-side listings found but none had a parseable price.")
         return
 
     # --- Load HK reference side (only refs we actually need) ---
@@ -834,7 +836,7 @@ def render_top_deals() -> None:
         & (hk_df["hk_usd"] <= 30_000_000)
     ].copy()
     if not len(hk_df):
-        st.info("None of these EU refs are present in HK yet — no comparison possible.")
+        st.info("None of these buy-side refs are present in HK yet — no comparison possible.")
         return
 
     hk_df["_sig"] = hk_df.apply(_spec_sig, axis=1)
