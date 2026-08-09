@@ -1,13 +1,20 @@
 /* ==========================================================================
-   WhatsApp Web message extractor  (v2 — more aggressive scroll triggers)
+   WhatsApp Web message extractor  (v3 — incremental scroll)
    --------------------------------------------------------------------------
+   Fix vs v2: v2 scrolled to top on every iteration, which caused WhatsApp
+   to fast-forward past middle date ranges. Result: only bookend dates
+   were captured (e.g. Jul 13-14 + Aug 8-9, missing the 3 weeks between).
+
+   v3 scrolls UPWARD in small steps and captures messages explicitly at
+   each step. Every batch passes through the viewport and gets picked up.
+
    HOW TO USE:
      1. Open https://web.whatsapp.com in Chrome and log in.
      2. Click into the target group chat.
      3. Open DevTools (⌥⌘J → Console tab).
      4. Type:  allow pasting  ↵   (only needed the first time)
      5. Paste this entire file, press Enter.
-     6. Wait. Progress lines appear like "… 1,234 messages so far".
+     6. Watch progress: "… 1,234 msgs [DD/MM/YYYY]" as it walks upward.
      7. When it finishes, `whatsapp_chat_YYYY-MM-DD.txt` downloads.
      8. Move it to  exports/wdg/YYYY-MM-DD_export.txt  and run
              python3 src/refresh.py --market wdg
@@ -17,9 +24,9 @@
   const messages = new Map();
   const META_RE = /^\[(\d{1,2}:\d{2}(?::\d{2})?),\s*(\d{1,2}\/\d{1,2}\/\d{4})\]\s*(.+?):\s*$/;
 
-  const capture = (root) => {
+  const capture = () => {
     let added = 0;
-    root.querySelectorAll('[data-pre-plain-text]').forEach(el => {
+    document.querySelectorAll('[data-pre-plain-text]').forEach(el => {
       const meta = el.getAttribute('data-pre-plain-text');
       const m = meta.match(META_RE);
       if (!m) return;
@@ -34,22 +41,7 @@
     return added;
   };
 
-  // Watch the whole document — messages come in via various mount points.
-  const observer = new MutationObserver(muts => {
-    for (const mu of muts) {
-      for (const n of mu.addedNodes) {
-        if (n.nodeType === 1) capture(n);
-      }
-    }
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
-
-  capture(document);
-  console.log(`Starting extraction. ${messages.size} messages already visible.`);
-
-  // Locate the scrollable pane by walking up from an existing message bubble
-  // to the nearest ancestor with vertical scrolling. Much more reliable than
-  // guessing CSS class names (WhatsApp scrambles those regularly).
+  // Locate the scrollable messages pane.
   const findScrollableAncestor = (el) => {
     let node = el;
     while (node && node !== document.body) {
@@ -63,87 +55,95 @@
     return null;
   };
 
-  let pane = null;
   const sampleMsg = document.querySelector('[data-pre-plain-text]');
-  if (sampleMsg) pane = findScrollableAncestor(sampleMsg);
+  const pane = sampleMsg ? findScrollableAncestor(sampleMsg) : null;
   if (!pane) {
-    // Fallback: scan candidates
-    pane = document.querySelector('#main [role="application"]') ||
-           document.querySelector('#main');
-  }
-  if (!pane) {
-    observer.disconnect();
-    alert("Couldn't find the chat pane. Open a chat and try again.");
+    alert("Couldn't find the WhatsApp chat pane. Open a chat and try again.");
     return;
   }
-  console.log('Scroll target:', pane, `scrollHeight=${pane.scrollHeight}`);
 
-  // Fire ALL of these on each iteration — WhatsApp's virtualized list responds
-  // to different triggers depending on version. Belt and suspenders.
-  const scrollUp = () => {
-    // 1) Direct scrollTop reset
-    pane.scrollTop = 0;
-    // 2) Wheel event with big negative delta (simulates fast wheel-up)
-    pane.dispatchEvent(new WheelEvent('wheel', {
-      deltaY: -3000, deltaMode: 0,
-      bubbles: true, cancelable: true, view: window,
-    }));
-    // 3) Focus + Home key (WhatsApp binds Home to jump-to-top)
-    pane.focus?.();
-    for (const target of [pane, document.activeElement, document.body]) {
-      if (!target) continue;
-      target.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'Home', code: 'Home', keyCode: 36, which: 36,
-        bubbles: true, cancelable: true,
-      }));
-      target.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'PageUp', code: 'PageUp', keyCode: 33, which: 33,
-        bubbles: true, cancelable: true,
-      }));
+  console.log(`Scroll pane found. Starting incremental extraction…`);
+  console.log(`Initial DOM messages: ${document.querySelectorAll('[data-pre-plain-text]').length}`);
+
+  // Initial capture of whatever's currently in view
+  capture();
+  console.log(`Captured initial batch: ${messages.size}`);
+
+  // Show progress with the OLDEST date we've reached so user knows where we are
+  const oldestDate = () => {
+    let oldest = null;
+    for (const v of messages.values()) {
+      const [dd, mm, yyyy] = v.date.split('/');
+      const d = new Date(+yyyy, +mm - 1, +dd);
+      if (!oldest || d < oldest) oldest = d;
     }
+    return oldest ? oldest.toISOString().slice(0, 10) : '?';
   };
 
-  // Bigger idle budget so slow servers don't cause premature stop.
-  const IDLE_TICKS_UNTIL_DONE = 25;
-  const SCROLL_WAIT_MS = 1500;
-  let idleTicks = 0;
-  let lastCount = messages.size;
+  // Incremental scroll parameters
+  const SCROLL_STEP_PX = 800;      // ~1 screenful of messages per step
+  const STEP_WAIT_MS = 1200;       // let batch settle after each step
+  const MAX_STALE_STEPS = 20;      // stop when scrollHeight stops growing
+
+  let staleSteps = 0;
+  let lastScrollHeight = pane.scrollHeight;
   let iter = 0;
 
-  while (idleTicks < IDLE_TICKS_UNTIL_DONE) {
-    scrollUp();
-    await new Promise(r => setTimeout(r, SCROLL_WAIT_MS));
+  while (staleSteps < MAX_STALE_STEPS) {
     iter++;
-    if (messages.size === lastCount) {
-      idleTicks++;
-      // Every 5 idle ticks, log so user knows we're still trying
-      if (idleTicks % 5 === 0) {
-        console.log(`  (waiting — ${idleTicks}/${IDLE_TICKS_UNTIL_DONE} idle, `
-                    + `scrollHeight=${pane.scrollHeight}, scrollTop=${pane.scrollTop})`);
+
+    // Scroll UP by SCROLL_STEP_PX. If we're already near the top, scrollTop
+    // clamps to 0 and WhatsApp will request the next older batch.
+    const before = pane.scrollTop;
+    pane.scrollTop = Math.max(0, before - SCROLL_STEP_PX);
+
+    // Also poke keyboard events some WhatsApp Web builds bind (PageUp/Home).
+    pane.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'PageUp', code: 'PageUp', keyCode: 33, bubbles: true,
+    }));
+
+    await new Promise(r => setTimeout(r, STEP_WAIT_MS));
+
+    // Capture after every step — don't rely on MutationObserver alone.
+    const added = capture();
+
+    // Progress heuristic: growing scrollHeight = older batch loaded.
+    const grew = pane.scrollHeight > lastScrollHeight + 50;
+    if (added > 0 || grew) {
+      staleSteps = 0;
+      lastScrollHeight = pane.scrollHeight;
+      if (iter % 3 === 0 || added > 5) {
+        console.log(`  step ${iter}: ${messages.size.toLocaleString()} msgs, oldest=${oldestDate()}, scrollH=${pane.scrollHeight.toLocaleString()}`);
       }
     } else {
-      idleTicks = 0;
-      const delta = messages.size - lastCount;
-      lastCount = messages.size;
-      console.log(`… ${messages.size.toLocaleString()} messages (+${delta})`);
+      staleSteps++;
+      // When we've clamped at scrollTop=0 for a while and nothing new is
+      // loading, try more aggressive triggers before giving up.
+      if (pane.scrollTop === 0 && staleSteps % 5 === 0) {
+        pane.dispatchEvent(new KeyboardEvent('keydown', {
+          key: 'Home', code: 'Home', keyCode: 36, bubbles: true,
+        }));
+        pane.dispatchEvent(new WheelEvent('wheel', {
+          deltaY: -3000, deltaMode: 0, bubbles: true, cancelable: true,
+        }));
+        console.log(`  step ${iter}: at top, waiting for lazy-load (${staleSteps}/${MAX_STALE_STEPS} idle)`);
+      }
     }
   }
 
-  observer.disconnect();
-  console.log(`Done. Captured ${messages.size.toLocaleString()} messages after ${iter} scroll cycles.`);
+  console.log(`\nDone. ${messages.size.toLocaleString()} messages captured in ${iter} steps.`);
 
-  if (messages.size < 100) {
+  if (messages.size < 200) {
     console.warn(
-      '⚠️  Very few messages captured. Common causes:\n' +
-      '   • Group has "Disappearing messages" enabled → old ones gone.\n' +
-      '   • WhatsApp Web hasn\'t cached older history from your phone.\n' +
-      '     Open the chat on your PHONE, scroll back manually, then reload\n' +
-      '     web.whatsapp.com and re-run this script.\n' +
-      '   • This is a fresh group without much history.'
+      "\n⚠️  Fewer than 200 messages captured. Your phone likely hasn't\n" +
+      "   cached deep history. Fix by:\n" +
+      "   1. Open WhatsApp on your PHONE\n" +
+      "   2. Open the group and scroll UP slowly (pause 5s every few scrolls)\n" +
+      "   3. Reload web.whatsapp.com (⌘R) and re-run this script"
     );
   }
 
-  // Sort chronologically, format as WhatsApp export, download.
+  // Sort chronologically, format as WhatsApp export, download
   const toDate = (d, t) => {
     const [dd, mm, yyyy] = d.split('/');
     const [hh, mi, se = '0'] = t.split(':');
@@ -152,6 +152,17 @@
   const rows = [...messages.values()].sort(
     (a, b) => toDate(a.date, a.time) - toDate(b.date, b.time)
   );
+
+  // Report date coverage so user can see gaps
+  const byDate = {};
+  rows.forEach(r => { byDate[r.date] = (byDate[r.date] || 0) + 1; });
+  console.log('\n📅 Messages per date:');
+  Object.entries(byDate).sort((a, b) => {
+    const pa = a[0].split('/').reverse().join('');
+    const pb = b[0].split('/').reverse().join('');
+    return pa.localeCompare(pb);
+  }).forEach(([d, n]) => console.log(`  ${d}: ${n}`));
+
   const lines = rows.map(r => {
     const time = r.time.split(':').length === 2 ? `${r.time}:00` : r.time;
     return `[${r.date} ${time}] ${r.sender}: ${r.text}`;
@@ -167,5 +178,5 @@
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
-  console.log(`Downloaded whatsapp_chat_${today}.txt`);
+  console.log(`\nDownloaded whatsapp_chat_${today}.txt`);
 })();
