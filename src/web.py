@@ -22,6 +22,11 @@ import streamlit as st
 
 # Ensure src/ is importable when Streamlit runs this file directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Streamlit Cloud reruns this script after a git pull but keeps already-imported
+# modules in memory; reload so a new paths.py is never paired with an old one.
+import importlib  # noqa: E402
+import paths  # noqa: E402
+importlib.reload(paths)
 from paths import db_path, ensure_unpacked  # noqa: E402
 
 for _m in ("hk", "eu", "wdg", "usmoda"):
