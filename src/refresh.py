@@ -21,7 +21,7 @@ from pathlib import Path
 from parser import parse_export
 from db import (
     connect, insert_listings, mark_export_loaded, is_export_loaded,
-    dedup_repeated_listings, vacuum, stats, fix_price_scale,
+    dedup_repeated_listings, vacuum, stats, fix_price_scale, fix_currency_labels,
 )
 from paths import db_path, exports_dir, MARKETS, USD_MARKETS, packed_path, pack
 
@@ -95,6 +95,9 @@ def main():
     if before != after:
         print(f"Dedup removed {before - after:,} repeated listings ({before:,} → {after:,}).")
     if args.market == "hk":
+        cx = fix_currency_labels(conn)
+        print(f"Currency labels: {cx['usdt_to_hkd']:,} 'USDT' prices that are HKD, "
+              f"{cx['hkd_to_usd']:,} 'HKD' prices that are USD — relabelled.")
         fx = fix_price_scale(conn)
         print(f"Price scale: {fx['rescaled']:,} decimal slips rescaled against their "
               f"reference median, {fx['removed']:,} sub-HKD-5k listings removed.")

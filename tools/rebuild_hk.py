@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from parser import extract_price, parse_export  # noqa: E402
 from db import (connect, insert_listings, mark_export_loaded,  # noqa: E402
-                dedup_repeated_listings, fix_price_scale)
+                dedup_repeated_listings, fix_price_scale, fix_currency_labels)
 
 
 def repair(conn, report) -> None:
@@ -97,6 +97,8 @@ def main() -> None:
                 print(msg, flush=True)
                 report.write(msg + "\n")
                 report.flush()
+        cx = fix_currency_labels(conn)
+        report.write(f"CURRENCY FIX: {cx}\n")
         fx = fix_price_scale(conn)
         before, after = dedup_repeated_listings(conn)
         msg = (f"SCALE FIX: {fx['rescaled']} rescaled, {fx['removed']} removed (<HKD 5k); "

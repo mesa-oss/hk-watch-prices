@@ -481,7 +481,7 @@ RMB_TO_HKD = 1.09
 # by either side.
 _PRICE_TOKEN = re.compile(
     r"(?:(?P<pre>HK\$|HKD|HK|US\$|U\$|USDT|USTD|UDST|USDR|USD|RMB|CNY|\$|¥|💰)"
-    r"(?P<presep>\s*[:：]?\s*\$?\s*)"
+    r"(?P<presep>\s*[:：～~=]?\s*\$?\s*)"
     r"|(?<![0-9])(?<![0-9]\.))"
     r"(?P<num>(?:\d{1,3}|(?<![0-9],)(?!19\d\d|20[0-3]\d)\d{4})(?:,\d{3})+(?!\d)(?:\.\d+)?"
     # ^ 2,450,000 / 680,000 / 1280,000 — but never '2023,345K' (year, price)
@@ -660,8 +660,9 @@ def extract_price(line: str, *, dollar_is_usd: bool = False) -> tuple[int | None
         # Bare 'U' only means USDT after a k/m amount ('419k u', '25.5ku');
         # '4000U/000R' is a Vacheron reference.
         if post_m and post_m.group("postu") and (
-                not suf or line[post_m.end():post_m.end() + 1] == "/"):
-            post = None
+                line[post_m.end():post_m.end() + 1] == "/"
+                or not (suf or re.fullmatch(r"\d{5,}", num.replace(",", "")))):
+            post = None  # '4000U/000R' is a ref; '$405000U' / '419k u' are USDT
         # A post-marker spaced from us but glued to the NEXT number belongs to
         # that number: '1.26 HKD99k' → HKD goes with 99k.
         if post and not post_glued and re.match(r"\$?\d", line[post_m.end():]):

@@ -151,6 +151,43 @@ def dedup_repeated_listings(conn: sqlite3.Connection) -> tuple[int, int]:
     return before, after
 
 
+def fix_currency_labels(conn: sqlite3.Connection, *, min_peers: int = 5) -> dict:
+    """Fix HKD/USD mislabels using each reference's HKD market price.
+
+    Some dealers write 'USDT 91,000' for a 126300 that trades at HKD 91k
+    (HKD price, wrong label); others write 'HKD 445k' or '$455k' for a watch
+    quoted in dollars. Read as labelled, these sit ~7.8x off the market. A
+    USDT-only price that matches the HKD median (0.7–1.4x) is moved to HKD; an
+    HKD-only price ~7.8x below it that matches once read as USD is moved to USD.
+    """
+    import statistics
+    from collections import defaultdict
+
+    hkd_by_ref = defaultdict(list)
+    rows = conn.execute(
+        "SELECT id, UPPER(reference), price_hkd, price_usdt, price_eur FROM listings"
+    ).fetchall()
+    for _id, ref, h, u, e in rows:
+        if h and not u:
+            hkd_by_ref[ref].append(h)
+    med = {r: statistics.median(v) for r, v in hkd_by_ref.items() if len(v) >= min_peers}
+    to_hkd, to_usd = [], []
+    for id_, ref, h, u, e in rows:
+        m = med.get(ref)
+        if not m or e:
+            continue
+        if u and not h and 0.7 <= u / m <= 1.4 and u * 7.8 / m > 3:
+            to_hkd.append((u, id_))
+        elif h and not u and h / m < 0.2 and 0.75 <= h * 7.8 / m <= 1.33:
+            to_usd.append((h, id_))
+    conn.executemany("UPDATE listings SET price_hkd=?, price_usdt=NULL, "
+                     "confidence='ccy-fixed' WHERE id=?", to_hkd)
+    conn.executemany("UPDATE listings SET price_usdt=?, price_hkd=NULL, "
+                     "confidence='ccy-fixed' WHERE id=?", to_usd)
+    conn.commit()
+    return {"usdt_to_hkd": len(to_hkd), "hkd_to_usd": len(to_usd)}
+
+
 def fix_price_scale(conn: sqlite3.Connection, *, min_peers: int = 5) -> dict:
     """Correct decimal/scale slips using each reference's own market price.
 

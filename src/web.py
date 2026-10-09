@@ -93,6 +93,33 @@ def row_to_usd(price_hkd, price_usdt, price_eur) -> float | None:
     return None
 
 
+# Each market tab shows ONE numeric price column in its own currency so it
+# sorts correctly. HK dealers' bare amounts and '$' are HKD; only explicit
+# USD/US$/USDT/'U' quotes are stored as dollars and get converted here.
+DISPLAY_CCY = {"hk": "HKD", "eu": "EUR", "wdg": "EUR", "usmoda": "USD"}
+HKD_PER = {"HKD": 1.0, "USD": 7.8, "EUR": 1.08 * 7.8}
+
+
+def row_in_ccy(price_hkd, price_usdt, price_eur, ccy: str) -> float | None:
+    if pd.notna(price_hkd):
+        hkd = float(price_hkd)
+    elif pd.notna(price_usdt):
+        hkd = float(price_usdt) * HKD_PER["USD"]
+    elif pd.notna(price_eur):
+        hkd = float(price_eur) * HKD_PER["EUR"]
+    else:
+        return None
+    return round(hkd / HKD_PER[ccy])
+
+
+def quoted_if_converted(price_hkd, price_usdt, price_eur, ccy: str) -> str:
+    """The dealer's original amount, shown only when it isn't in `ccy`."""
+    for cur, v in (("HKD", price_hkd), ("USD", price_usdt), ("EUR", price_eur)):
+        if pd.notna(v):
+            return "" if cur == ccy else f"{cur} {int(v):,}"
+    return ""
+
+
 # ----- Formatting helpers (used by both tabs) -----
 def fmt_year(y) -> str:
     return str(int(y)) if pd.notna(y) else ""
@@ -100,20 +127,6 @@ def fmt_year(y) -> str:
 
 def fmt_month(m) -> str:
     return f"N{int(m)}" if pd.notna(m) else ""
-
-
-def fmt_price(hkd, usdt, eur=None) -> str:
-    """Pretty-print in whichever native currency the seller used."""
-    if pd.notna(eur):
-        v = float(eur)
-        return f"{v/1_000_000:.2f}M €" if v >= 1_000_000 else f"{int(v/1_000):,}k €"
-    if pd.notna(hkd):
-        v = float(hkd)
-        return f"{v/1_000_000:.2f}M" if v >= 1_000_000 else f"{int(v/1_000):,}k"
-    if pd.notna(usdt):
-        u = float(usdt)
-        return f"{u/1_000_000:.2f}M ₮" if u >= 1_000_000 else f"{int(u/1_000):,}k ₮"
-    return ""
 
 
 def fmt_usd(x) -> str:
@@ -256,8 +269,8 @@ def render_market_view(market: str) -> None:
 
     order_clause = {
         "Newest": "posted_at DESC",
-        "Price ↑": "COALESCE(price_hkd, price_usdt*7.8, price_eur*8.4) ASC NULLS LAST",
-        "Price ↓": "COALESCE(price_hkd, price_usdt*7.8, price_eur*8.4) DESC NULLS LAST",
+        "Price ↑": "COALESCE(price_hkd, price_usdt*7.8, price_eur*8.424) ASC NULLS LAST",
+        "Price ↓": "COALESCE(price_hkd, price_usdt*7.8, price_eur*8.424) DESC NULLS LAST",
         "Year ↓": "year_made DESC NULLS LAST, posted_at DESC",
     }[sort_by]
 
@@ -290,25 +303,34 @@ def render_market_view(market: str) -> None:
     df["Metal"] = df["metal"].fillna("")
     df["Dial"] = df.apply(lambda r: fmt_dial(r["dial_color"], r["dial_details"]), axis=1)
     df["Description"] = df["raw_line"].fillna("")
-    df["Price"] = df.apply(
-        lambda r: fmt_price(r["price_hkd"], r["price_usdt"], r.get("price_eur")),
+    ccy = DISPLAY_CCY.get(market, "HKD")
+    price_col = f"Price ({ccy})"
+    df[price_col] = df.apply(
+        lambda r: row_in_ccy(r["price_hkd"], r["price_usdt"], r["price_eur"], ccy),
+        axis=1,
+    )
+    df["Quoted"] = df.apply(
+        lambda r: quoted_if_converted(r["price_hkd"], r["price_usdt"], r["price_eur"], ccy),
         axis=1,
     )
     # Compact posted timestamp: 'MM-DD HH:MM' — enough to see freshness at a
     # glance without eating column width. Full ISO is still in the expander.
     df["Posted"] = df["posted_at"].str.slice(5, 16).str.replace("T", " ")
 
-    hkd = df["price_hkd"].dropna()
-    if len(hkd):
+    prices = df[price_col].dropna()
+    if len(prices):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Matches", f"{len(df):,}")
-        m2.metric("Median", f"{int(hkd.median()/1000):,}k")
-        m3.metric("Low", f"{int(hkd.min()/1000):,}k")
-        m4.metric("High", f"{int(hkd.max()/1000):,}k")
+        m2.metric(f"Median {ccy}", f"{int(prices.median()/1000):,}k")
+        m3.metric(f"Low {ccy}", f"{int(prices.min()/1000):,}k")
+        m4.metric(f"High {ccy}", f"{int(prices.max()/1000):,}k")
     else:
-        st.caption(f"{len(df):,} matches · prices in HKD")
+        st.caption(f"{len(df):,} matches")
 
-    compact = df[["Posted", "Ref", "Year", "N", "Metal", "Dial", "Description", "Price"]]
+    cols = ["Posted", "Ref", "Year", "N", "Metal", "Dial", price_col, "Description"]
+    if df["Quoted"].str.len().gt(0).any():
+        cols.insert(cols.index(price_col) + 1, "Quoted")
+    compact = df[cols]
     st.dataframe(
         compact,
         width="stretch",
@@ -324,7 +346,11 @@ def render_market_view(market: str) -> None:
                 help="Case metal decoded from Rolex 6th digit"),
             "Dial": st.column_config.TextColumn(width="medium"),
             "Description": st.column_config.TextColumn(width="large"),
-            "Price": st.column_config.TextColumn(width="small"),
+            price_col: st.column_config.NumberColumn(width="small", format="localized",
+                help=f"All prices in {ccy} so the column sorts correctly "
+                     f"(USD/USDT ×7.8 → HKD). Click the header to sort."),
+            "Quoted": st.column_config.TextColumn(width="small",
+                help=f"Dealer's original quote, when it wasn't in {ccy}"),
         },
     )
 
