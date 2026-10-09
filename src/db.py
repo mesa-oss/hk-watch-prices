@@ -114,8 +114,9 @@ def dedup_repeated_listings(conn: sqlite3.Connection) -> tuple[int, int]:
 
     Dealers (e.g. Lisa Watch) re-post the same stock list every few hours.
     When the seller, reference, dial color, dial details, year, month,
-    condition, full-set flag, and both prices all match, only the most
-    recent row is kept.
+    condition, full-set flag, and all prices match, only the row with the
+    latest posted_at is kept (the same post can arrive from several groups
+    or exports, so insertion order says nothing about recency).
 
     Returns (rows_before, rows_after).
     """
@@ -123,26 +124,84 @@ def dedup_repeated_listings(conn: sqlite3.Connection) -> tuple[int, int]:
     conn.execute(
         """
         DELETE FROM listings
-        WHERE id NOT IN (
-            SELECT MAX(id) FROM listings
-            GROUP BY
-                seller,
-                COALESCE(reference, ''),
-                COALESCE(dial_color, ''),
-                COALESCE(dial_details, ''),
-                COALESCE(year_made, 0),
-                COALESCE(month_made, 0),
-                COALESCE(condition, ''),
-                COALESCE(full_set, -1),
-                COALESCE(price_hkd, 0),
-                COALESCE(price_usdt, 0),
-                COALESCE(price_eur, 0)
+        WHERE id IN (
+            SELECT id FROM (
+                SELECT id, ROW_NUMBER() OVER (
+                    PARTITION BY
+                        seller,
+                        COALESCE(reference, ''),
+                        COALESCE(dial_color, ''),
+                        COALESCE(dial_details, ''),
+                        COALESCE(year_made, 0),
+                        COALESCE(month_made, 0),
+                        COALESCE(condition, ''),
+                        COALESCE(full_set, -1),
+                        COALESCE(price_hkd, 0),
+                        COALESCE(price_usdt, 0),
+                        COALESCE(price_eur, 0)
+                    ORDER BY posted_at DESC, id DESC
+                ) AS rn
+                FROM listings
+            ) WHERE rn > 1
         )
         """
     )
     conn.commit()
     after = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
     return before, after
+
+
+def fix_price_scale(conn: sqlite3.Connection, *, min_peers: int = 5) -> dict:
+    """Correct decimal/scale slips using each reference's own market price.
+
+    HK dealers write the same amount many ways ('HKD 9.5k' = 95k for a steel
+    Rolex, 'HKD 2.069k' = 2.07M for a Patek, 'HKD 155,000' typed for 1.55M).
+    Text alone can't tell which, but the other listings of that reference can:
+    a listing ~10x / 100x / 1000x BELOW its reference median that lands within
+    0.6–1.6x of it once scaled up is a decimal slip and is rescaled. Prices
+    above the median are never touched (gem-set/Tiffany variants share refs). Listings under HKD 5,000-equivalent that can't be
+    rescaled are removed: no watch in these groups trades that low.
+    """
+    import statistics
+    from collections import defaultdict
+
+    usdt_hkd, eur_hkd = 7.8, 8.5
+    by_ref = defaultdict(list)
+    for id_, ref, h, u, e in conn.execute(
+        "SELECT id, UPPER(reference), price_hkd, price_usdt, price_eur FROM listings"
+    ):
+        v = h or (u * usdt_hkd if u else None) or (e * eur_hkd if e else None)
+        if v:
+            by_ref[ref].append((id_, v, h, u, e))
+
+    fixes, drops, examples = [], [], []
+    for ref, items in by_ref.items():
+        med = statistics.median(v for _, v, *_ in items) if len(items) >= min_peers else None
+        for id_, v, h, u, e in items:
+            # Only too-LOW prices are rescaled. A fake-cheap HK price becomes
+            # the "cheapest same-spec" and hides real deals; a too-high one is
+            # ignored by min() anyway, and is often a genuine gem-set/Tiffany
+            # variant sharing the base reference — so those stay untouched.
+            if med and v / med < 0.25:
+                for k in (1, 2, 3):
+                    f = 10 ** k
+                    if 0.6 <= v * f / med <= 1.6:
+                        fixes.append((h and round(h * f), u and round(u * f),
+                                      e and round(e * f), id_))
+                        if len(examples) < 40:
+                            examples.append((ref, med, v, v * f))
+                        v *= f
+                        break
+            if v < 5000 or (med and v / med < 0.05):
+                # under HKD 5k, or 20x+ below its reference with no decimal
+                # explanation ('hkd 8k' for a 418k 5205R): never a real offer
+                drops.append((id_,))
+    conn.executemany(
+        "UPDATE listings SET price_hkd=?, price_usdt=?, price_eur=?, "
+        "confidence='scale-fixed' WHERE id=?", fixes)
+    conn.executemany("DELETE FROM listings WHERE id=?", drops)
+    conn.commit()
+    return {"rescaled": len(fixes), "removed": len(drops), "examples": examples}
 
 
 def stats(conn: sqlite3.Connection) -> dict:

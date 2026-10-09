@@ -22,7 +22,10 @@ import streamlit as st
 
 # Ensure src/ is importable when Streamlit runs this file directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from paths import db_path  # noqa: E402
+from paths import db_path, ensure_unpacked  # noqa: E402
+
+for _m in ("hk", "eu", "wdg", "usmoda"):
+    ensure_unpacked(_m)
 
 st.set_page_config(
     page_title="Watch Prices",

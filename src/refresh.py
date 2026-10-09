@@ -21,18 +21,18 @@ from pathlib import Path
 from parser import parse_export
 from db import (
     connect, insert_listings, mark_export_loaded, is_export_loaded,
-    dedup_repeated_listings, vacuum, stats,
+    dedup_repeated_listings, vacuum, stats, fix_price_scale,
 )
-from paths import db_path, exports_dir, MARKETS, USD_MARKETS
+from paths import db_path, exports_dir, MARKETS, USD_MARKETS, packed_path, pack
 
 
 def load_export(conn, path: Path, *, force: bool, use_llm: bool,
-                dollar_is_usd: bool = False) -> int:
+                dollar_is_usd: bool = False, since: str | None = None) -> int:
     if not force and is_export_loaded(conn, path.name):
         print(f"  · {path.name}: already loaded (use --force to reparse)")
         return 0
 
-    result = parse_export(path, dollar_is_usd=dollar_is_usd)
+    result = parse_export(path, dollar_is_usd=dollar_is_usd, since=since)
     print(f"  · {path.name}: parsed {len(result.listings)} listings, "
           f"{len(result.unparsed)} unparsed candidates")
 
@@ -58,6 +58,8 @@ def main():
                     help="Which market DB to load into (default: hk)")
     ap.add_argument("--force", action="store_true", help="Reload exports already marked as loaded")
     ap.add_argument("--llm", action="store_true", help="Use Claude API to recover unparsed lines")
+    ap.add_argument("--since", help="Only parse messages on/after this date (YYYY-MM-DD). "
+                                    "Exports contain the full chat history; use the DB's last date.")
     args = ap.parse_args()
 
     db_file = db_path(args.market)
@@ -81,7 +83,7 @@ def main():
     total = 0
     for f in files:
         total += load_export(conn, f, force=args.force, use_llm=args.llm,
-                             dollar_is_usd=dollar_is_usd)
+                             dollar_is_usd=dollar_is_usd, since=args.since)
 
     print()
     print(f"Done. Inserted {total} new rows total.")
@@ -92,9 +94,17 @@ def main():
     before, after = dedup_repeated_listings(conn)
     if before != after:
         print(f"Dedup removed {before - after:,} repeated listings ({before:,} → {after:,}).")
+    if args.market == "hk":
+        fx = fix_price_scale(conn)
+        print(f"Price scale: {fx['rescaled']:,} decimal slips rescaled against their "
+              f"reference median, {fx['removed']:,} sub-HKD-5k listings removed.")
+        dedup_repeated_listings(conn)
     # Reclaim space from deleted rows — otherwise the .db file keeps
     # growing on every refresh even though row count goes down.
     vacuum(conn)
+    if packed_path(args.market).exists():
+        pack(args.market)
+        print(f"Packed → {packed_path(args.market).name}")
     print()
     s = stats(conn)
     print(f"DB now has {s['total_listings']} listings, "

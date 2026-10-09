@@ -14,3 +14,11 @@ data/~$*
 
 # OS
 .DS_Store
+
+# HK DB is committed xz-compressed (data/watches.db.xz); the app unpacks it.
+data/watches.db
+data/*.unpacking
+data/*.xz.tmp
+
+# local tooling
+.claude/

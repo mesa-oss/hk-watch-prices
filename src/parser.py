@@ -473,6 +473,127 @@ def _extract_eur(line: str) -> int | None:
     return None
 
 
+RMB_TO_HKD = 1.09
+
+# One price token: optional currency-before marker, a number in any of the
+# dealer formats, an optional multiplier suffix. Currency-after is checked
+# separately (_POST_MARKER) so a marker between two numbers can be claimed
+# by either side.
+_PRICE_TOKEN = re.compile(
+    r"(?:(?P<pre>HK\$|HKD|HK|US\$|U\$|USDT|USTD|UDST|USDR|USD|RMB|CNY|\$|¥|💰)"
+    r"(?P<presep>\s*[:：]?\s*\$?\s*)"
+    r"|(?<![0-9])(?<![0-9]\.))"
+    r"(?P<num>(?:\d{1,3}|(?<![0-9],)(?!19\d\d|20[0-3]\d)\d{4})(?:,\d{3})+(?!\d)(?:\.\d+)?"
+    # ^ 2,450,000 / 680,000 / 1280,000 — but never '2023,345K' (year, price)
+    r"|\d{1,3}(?:,\d{2,3}){2,}"                      # 1,26,000 / 5,870,00 (malformed → dropped)
+    r"|\d{1,3}(?:\.\d{3}){2,}"                      # 1.250.000
+    r"|\d{1,3}(?:[  ]\d{3})+(?=\s*(?:hkd|usdt|usd|u\b))"  # 680 000 hkd
+    r"|\d+\.\d+"                                     # 1.55 / 410.000
+    r"|\d{1,3},\d{1,2}(?!\d)"                        # 1,82m / 11,3k / 197,5k (comma decimal)
+    r"|\d{1,3}\. \d(?=k)"                             # '204. 5k' = 204.5k
+    r"|\d+)"
+    # 'm' must not be 'mm'/'May'; 'k' must not be 'kg'. A following u/hkd/usd
+    # is fine, and so is a month marker like '126kN6'.
+    r"(?:\s?(?P<suf>million|mio|mil|kk|k|m|万|萬)"
+    r"(?!(?!hkd|usd|ust|u(?![a-z])|[a-z]\d)[a-z])"
+    r"|(?P<sufw>w)(?![a-z&/]))?",  # 179W = 萬, but only glued, never 'W&P'
+    re.I,
+)
+_POST_MARKER = re.compile(
+    r"(?P<sep>\s*)(?:(?P<post>HK\$|US\$|U\$|HKD|USDT|USTD|UDST|USDR|USD|RMB|CNY|HK"
+    r"|元|人民币|人民幣)|(?P<postu>U)(?![a-z]))",
+    re.I,
+)
+_MULT = {"k": 1e3, "kk": 1e3, "m": 1e6, "mil": 1e6, "mio": 1e6, "million": 1e6,
+         "w": 1e4, "万": 1e4, "萬": 1e4}
+_GOLD_AFTER = re.compile(
+    r"\s*(?:k?t\b|ct\b|gold|white|rose|yellow|pink|red\b|everose|sedna|king|honey"
+    r"|wg|rg|yg|pg|solid|/)", re.I)
+_GOLD_BEFORE = re.compile(r"(?:gold|white|rose|yellow|pink|solid)\s*$", re.I)
+_HKD_WORD = re.compile(r"HKD|HK\$", re.I)
+
+
+def _currency(marker: str | None) -> str | None:
+    if not marker:
+        return None
+    mk = marker.upper()
+    if mk in ("HKD", "HK$", "HK"):
+        return "HKD"
+    if mk in ("USDT", "USTD", "UDST", "USDR", "U"):
+        return "USDT"
+    if mk in ("USD", "US$", "U$"):
+        return "USD"
+    if mk in ("RMB", "CNY", "¥", "元", "人民币", "人民幣"):
+        return "RMB"
+    return "$"  # '$' or '💰' — HKD in HK lists, USD in US/WDG lists
+
+
+def _to_amount(num: str, suf: str, cur: str | None, *, dollar_is_usd: bool,
+               gold_context: bool = False) -> int | None:
+    """Turn one price token into an integer amount, or None if it isn't one.
+
+    Separator rules (from real HK dealer data):
+      2,450,000 / 1.250.000 / 680 000   → thousands separators
+      1,82m / 2,5m                       → comma is a decimal point
+      410.000 HKD, 139.000 USDT          → dot = thousands (2+ leading digits,
+                                            or any USDT amount: '9.800Usdt')
+      HKD 1.830 / HKD3.147               → 1 leading digit = millions
+      HKD 1.94 / 2.32 HKD                → millions with the 'm' left off
+    """
+    usd_like = cur in ("USDT", "USD") or (cur in ("$", None) and dollar_is_usd)
+    s = num.replace("\u00a0", " ")
+    if re.fullmatch(r"\d{1,3}\. \d", s):
+        s = s.replace(" ", "")
+    if suf == "k" and re.fullmatch(r"\d{5,}", s):
+        suf = ""  # 'HKD 51000k' / '421000k usdt' — the k is a typo
+    if re.fullmatch(r"\d,\d{3}", s) and suf in ("m", "mil", "mio", "million"):
+        val = float(s.replace(",", "."))  # 'HKD 1,960M' = 1.96M, not 1.96 billion
+    elif re.fullmatch(r"\d{1,4}(?:,\d{3})+\.\d{3}", s) and not suf:
+        val = float(s.replace(",", "").replace(".", ""))  # 'HKD 1,360.000'
+    elif re.fullmatch(r"\d{1,4}(?:,\d{3})+(?:\.\d+)?", s):
+        val = float(s.replace(",", ""))
+    elif s.count(",") >= 2:
+        return None  # '1,26,000' / '5,870,00': can't tell 126k from 1.26M
+    elif re.fullmatch(r"\d{1,3}(?:\.\d{3}){2,}", s):
+        val = float(s.replace(".", ""))
+    elif " " in s:
+        val = float(s.replace(" ", ""))
+    elif "." in s or "," in s:
+        whole, frac = re.split(r"[.,]", s)
+        if suf == "k" and "." in s and len(frac) == 3 and len(whole) == 1:
+            val = float(whole + frac)  # '1.465k hkd' = 1,465k, not 1,465
+        elif suf:
+            val = float(f"{whole}.{frac}")
+        elif cur is None:
+            return None  # bare decimal with no suffix: a ref like 235.032
+        elif len(frac) == 3 and "." in s:
+            if usd_like or len(whole) >= 2:
+                val = float(whole + frac)
+            else:
+                val = float(s) * 1e6
+        elif len(frac) <= 2 and not usd_like and len(whole) == 1:
+            val = float(f"{whole}.{frac}") * 1e6  # 'HKD 2.33' / '$1,4HKD'
+        else:
+            return None
+    else:
+        val = float(s)
+        if not suf and 1900 <= val <= 2039:
+            return None  # model year next to a currency word
+
+    if suf:
+        if cur is None and suf == "k" and gold_context and s in ("9", "14", "18", "22", "24"):
+            return None  # '18k gold', 'Yellow Gold 18k'
+        if cur is None and suf == "m" and "." not in s and "," not in s and val >= 30:
+            return None  # '300m' water resistance
+        val *= _MULT[suf]
+
+    if val < 1000:
+        return None
+    if val > (8_000_000 if usd_like else 60_000_000):
+        return None
+    return int(round(val))
+
+
 def extract_price(line: str, *, dollar_is_usd: bool = False) -> tuple[int | None, int | None, int | None, str]:
     """Extract price and return (hkd, usdt, eur, matched_chunk).
 
@@ -488,76 +609,118 @@ def extract_price(line: str, *, dollar_is_usd: bool = False) -> tuple[int | None
     EUR uses European thousands-separator convention (see _extract_eur).
     """
     eur = _extract_eur(line)
-    # Greedy: look for explicit HKD/USDT/$ markers first
-    pats = [
-        re.compile(r"(?:HKD|hkd)\s*:?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
-        re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?\s*(?:HKD|hkd)", re.I),
-        re.compile(r"(?:USDT|usdt)\s*:?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
-        re.compile(r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?\s*(?:USDT|usdt)", re.I),
-        re.compile(r"\$\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
-        re.compile(r"💰\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(k|m|mil)?", re.I),
-        # Note: a generic 'price:' pattern was removed — it swallowed the
-        # word 'price' in unrelated contexts (e.g. 'Max price: 12500€') and
-        # mis-tagged EUR amounts as HKD.
-    ]
     hkd = None
     usdt = None
-    for pat in pats:
-        for m in pat.finditer(line):
-            amt_str = m.group(1).replace(",", "")
-            try:
-                amt = float(amt_str)
-            except ValueError:
-                continue
-            suf = (m.group(2) or "").lower()
-            # Reject year-shape values BEFORE any multiplier — a bare
-            # number in 1900-2039 with no k/m suffix is almost certainly
-            # a model year that got adjacent to a currency keyword
-            # (e.g. '5470P n6/2026 HKD $3.1m' — parser grabbed '2026 HKD').
-            if 1900 <= amt <= 2039 and not suf:
-                continue
-            if suf == "k":
-                amt *= 1_000
-            elif suf in ("m", "mil"):
-                amt *= 1_000_000
-            elif amt < 1000:
-                # Bare number under 1000 is probably not a price unless followed by k/m
-                continue
-            pat_src = pat.pattern.lower()
-            is_usdt_pat = "usdt" in pat_src
-            is_dollar_pat = pat_src.startswith(r"\$")
-            # In HK dealer lists "$" means HKD (dollar_is_usd=False, default).
-            # In US markets "$" means USD, which we store in price_usdt
-            # (USDT ≈ USD for FX purposes, and adding a fourth column just for
-            # US is heavier than it's worth right now).
-            if is_usdt_pat or (is_dollar_pat and dollar_is_usd):
-                if usdt is None:
-                    usdt = int(amt)
+    hkd_weak = None  # from a bare '$'/'💰' marker; explicit HKD wins over it
+    usdt_weak = None
+    bare_suffixed: list[int] = []
+    consumed_marker_end = -1  # end index of a post-marker already used
+
+    pos = 0
+    while True:
+        m = _PRICE_TOKEN.search(line, pos)
+        if not m:
+            break
+        pos = m.end()
+        num = m.group("num")
+        suf = (m.group("suf") or m.group("sufw") or "").lower()
+        pre_raw, pre_sep = m.group("pre"), m.group("presep") or ""
+        # What sits right before the number decides how much proof we need
+        # that it's a price and not a date/ref fragment:
+        #   letter  'n1.26', 'Rm33', 'N4'  → needs a currency marker
+        #   dash    '5124G-001', '-162,000 HKD' → needs a currency marker
+        #   'd/'    '2025/10', 'N6/152k'   → needs a k/m suffix
+        before = line[:m.start("num")] if not pre_raw else ""
+        after_year = bool(re.search(r"\d{2,4}\s?(?:y|yr|year)$", before, re.I))
+        glued_to_letter = bool(before) and before[-1].isalpha() and not after_year
+        after_dash = before.endswith("-")
+        after_digit_slash = bool(re.search(r"\d/$", before))
+        lead = re.match(r"\d+", num).end()
+        # 'N6,205K', 'N2,126K', 'N8/26,550K', 'n1.26': a month/date glued to
+        # the price. Drop the date digits and rescan from the separator.
+        month_glued = (((glued_to_letter and before[-1] in "nN") or after_dash)
+                       and lead <= 2 and num[lead:lead + 1] in (",", ".", " ", "\u00a0"))
+        # ^ also '2020-12,330K' / '2026-8,268K': the month after a dash
+        if month_glued or (after_digit_slash and (not suf or lead < len(num))):
+            if lead < len(num):
+                pos = m.start("num") + lead
+            continue
+        pre = _currency(pre_raw)
+        pre_glued = bool(pre) and not re.search(r"\s", pre_sep)
+        pre_weak = pre in ("$",)
+        # A pre-marker already used as the previous number's post-marker
+        # (e.g. '830000 HKD 105800 USDT') does not belong to this number.
+        if pre and m.start("pre") < consumed_marker_end:
+            pre, pre_weak = None, False
+
+        post_m = _POST_MARKER.match(line, m.end())
+        post_raw = (post_m.group("post") or post_m.group("postu")) if post_m else None
+        post = _currency(post_raw)
+        post_glued = bool(post_m) and post_m.group("sep") == ""
+        # Bare 'U' only means USDT after a k/m amount ('419k u', '25.5ku');
+        # '4000U/000R' is a Vacheron reference.
+        if post_m and post_m.group("postu") and (
+                not suf or line[post_m.end():post_m.end() + 1] == "/"):
+            post = None
+        # A post-marker spaced from us but glued to the NEXT number belongs to
+        # that number: '1.26 HKD99k' → HKD goes with 99k.
+        if post and not post_glued and re.match(r"\$?\d", line[post_m.end():]):
+            post = None
+        if post and not suf and re.fullmatch(r"\d{1,2}[.,]\d{1,2}", num) \
+                and re.match(r"\s*\$?\d", line[post_m.end():]):
+            post = None
+        if (glued_to_letter or after_dash) and not post:
+            if lead < len(num):
+                pos = m.start("num") + lead
+            continue
+
+        # Resolve currency for this number.
+        if pre and post and pre != post and not pre_weak:
+            if post_glued and not pre_glued:
+                cur = post
             else:
-                if hkd is None:
-                    hkd = int(amt)
-    # Fallback 1: a bare `<num>k` or `<num>m` suffix (no currency word) — these
-    # are HKD by default in HK price lists. e.g. "ref Black 2024 720k"
-    # Skip if EUR was already captured (avoids '€10.3k' being counted as both
-    # EUR 10300 AND HKD 10300).
+                cur = pre
+        elif post and (not pre or pre_weak or pre == post):
+            cur = post
+        else:
+            cur = pre  # may be '$' (weak) or None (bare)
+
+        gold = bool(_GOLD_AFTER.match(line, m.end())
+                    or _GOLD_BEFORE.search(line[max(0, m.start() - 14):m.start()]))
+        amt = _to_amount(num, suf, cur, dollar_is_usd=dollar_is_usd, gold_context=gold)
+        if amt is None:
+            continue
+        if cur and post and cur == post:
+            consumed_marker_end = post_m.end()
+
+        if cur is None:
+            if suf:
+                bare_suffixed.append(amt)
+            continue
+        if cur == "$":
+            if dollar_is_usd:
+                usdt_weak = usdt_weak if usdt_weak is not None else amt
+            else:
+                hkd_weak = hkd_weak if hkd_weak is not None else amt
+        elif cur == "HKD":
+            hkd = hkd if hkd is not None else amt
+        elif cur in ("USDT", "USD"):
+            usdt = usdt if usdt is not None else amt
+        elif cur == "RMB":
+            hkd = hkd if hkd is not None else int(round(amt * RMB_TO_HKD))
+
+    if hkd is None:
+        hkd = hkd_weak
+    if usdt is None:
+        usdt = usdt_weak
+
+    # Fallback 1: a bare `<num>k` / `<num>m` / `<num>w` with no currency word —
+    # HKD by default in HK price lists ("ref Black 2024 720k"). Skipped when
+    # EUR was captured so '€10.3k' isn't counted twice.
     if hkd is None and usdt is None and eur is None:
-        # Find numbers not preceded by a letter or currency symbol.
-        for m in re.finditer(
-            r"(?<![A-Za-z\-/€])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*([kKmM]|mil|MIL)\b",
-            line,
-        ):
-            amt_str = m.group(1).replace(",", "")
-            try:
-                amt = float(amt_str)
-            except ValueError:
-                continue
-            suf = m.group(2).lower()
-            if suf == "k":
-                amt *= 1_000
-            else:
-                amt *= 1_000_000
+        for amt in bare_suffixed:
             if amt >= 5000:
-                hkd = int(amt)
+                hkd = amt
                 break
 
     # Fallback 2: a 5-7 digit integer near the end of the line (likely an
@@ -565,11 +728,16 @@ def extract_price(line: str, *, dollar_is_usd: bool = False) -> tuple[int | None
     if hkd is None and usdt is None and eur is None:
         # Search ONLY in the second half of the line — refs are at the start
         half = max(len(line) // 2, 1)
-        for m in re.finditer(r"\b(\d{5,7})\b", line[half:]):
+        for m in re.finditer(r"\b(\d{5,7})\b(?![.,]\d)", line):
+            if m.end() <= half:
+                continue  # don't slice the line: '5164G 1190000' must stay whole
             amt = int(m.group(1))
             if 5000 <= amt <= 50_000_000:
                 hkd = amt
                 break
+    # A bare amount in a US-dollar market is dollars, not HKD.
+    if dollar_is_usd and hkd is not None and usdt is None and not _HKD_WORD.search(line):
+        hkd, usdt = None, hkd
     return hkd, usdt, eur, line
 
 
@@ -982,7 +1150,9 @@ def parse_line(line: str, posted_at: str, seller: str, message_context: str, sou
         price_usdt=usdt,
         full_set=full_set,
         raw_line=line.strip(),
-        raw_message=message_context[:500],
+        # The full message isn't shown anywhere and was half the DB size;
+        # the original is still in the export file.
+        raw_message="",
         source_file=source_file,
         confidence="regex",
         clean_line=strip_emojis(line),
@@ -1037,12 +1207,16 @@ class ParseResult:
         )
 
 
-def parse_export(path: Path, *, dollar_is_usd: bool = False) -> ParseResult:
+def parse_export(path: Path, *, dollar_is_usd: bool = False, since: str | None = None) -> ParseResult:
+    """since: ISO date/datetime; messages posted before it are skipped
+    (exports always contain the whole chat history)."""
     text = path.read_text(encoding="utf-8")
     result = ParseResult()
     source_file = path.name
 
     for posted_at, seller, body in iter_messages(text):
+        if since and posted_at < since:
+            continue
         if is_system_message(body):
             continue
         if not body.strip():
