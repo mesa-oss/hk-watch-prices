@@ -28,6 +28,9 @@ import importlib  # noqa: E402
 import paths  # noqa: E402
 importlib.reload(paths)
 from paths import db_path, ensure_unpacked  # noqa: E402
+import wtb  # noqa: E402
+importlib.reload(wtb)
+from wtb import GABY_WTB  # noqa: E402
 
 for _m in ("hk", "eu", "wdg", "usmoda"):
     ensure_unpacked(_m)
@@ -1013,7 +1016,7 @@ def render_top_deals() -> None:
 
 
 # ----- Top-level tabs: 🔥 Top Deals FIRST, then per-market, then Deal Finder -----
-tab_titles = ["🔥 Top Deals"] + [MARKET_LABEL[m] for m in MARKETS_AVAILABLE] + ["🔀 Deal Finder"]
+tab_titles = ["🔥 Top Deals"] + [MARKET_LABEL[m] for m in MARKETS_AVAILABLE] + ["🔀 Deal Finder", "🧾 Gaby's WTB"]
 tabs = st.tabs(tab_titles)
 
 with tabs[0]:
@@ -1026,7 +1029,7 @@ for i, m in enumerate(MARKETS_AVAILABLE):
 # ==========================================================================
 # LAST TAB — Deal Finder (buy-side listings + reference-market cheapest)
 # ==========================================================================
-with tabs[-1]:
+with tabs[-2]:
     st.markdown(
         "**Browse listings from one market with the cheapest same-spec price "
         "from another market attached.** Delta = reference-market cheapest "
@@ -1054,3 +1057,14 @@ with tabs[-1]:
         )
 
     render_deal_finder(buy_market, ref_market)
+
+
+# ==========================================================================
+# Gaby's want-to-buy list (as he sent it)
+# ==========================================================================
+with tabs[-1]:
+    st.markdown("**What Gaby is looking for, and his budget.**")
+    st.table(
+        pd.DataFrame(GABY_WTB, columns=["Looking for", "Budget", "Note"])
+        .set_index("Looking for")
+    )
