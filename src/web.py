@@ -1016,53 +1016,18 @@ def render_top_deals() -> None:
 
 
 # ----- Top-level tabs: 🔥 Top Deals FIRST, then per-market, then Deal Finder -----
-tab_titles = ["🔥 Top Deals"] + [MARKET_LABEL[m] for m in MARKETS_AVAILABLE] + ["🔀 Deal Finder", "🧾 Gaby's WTB"]
-tabs = st.tabs(tab_titles)
+# Only HK + Gaby's list for now. Top Deals, WDG, US Moda and Deal Finder are
+# hidden; render_top_deals / render_market_view / render_deal_finder still
+# exist — add them back here to show those tabs again.
+hk_tab, gaby_tab = st.tabs(["🇭🇰 HK", "🧾 Gaby's WTB"])
 
-with tabs[0]:
-    render_top_deals()
-
-for i, m in enumerate(MARKETS_AVAILABLE):
-    with tabs[i + 1]:
-        render_market_view(m)
-
-# ==========================================================================
-# LAST TAB — Deal Finder (buy-side listings + reference-market cheapest)
-# ==========================================================================
-with tabs[-2]:
-    st.markdown(
-        "**Browse listings from one market with the cheapest same-spec price "
-        "from another market attached.** Delta = reference-market cheapest "
-        "minus this listing's price, both in USD (HKD ÷ 7.8, EUR × 1.08). "
-        "Positive delta = you'd buy on the left, sell on the right."
-    )
-
-    dm1, dm2 = st.columns(2)
-    with dm1:
-        buy_market = st.selectbox(
-            "🛒 Browse (buy here)",
-            MARKETS_AVAILABLE,
-            index=(MARKETS_AVAILABLE.index("eu") if "eu" in MARKETS_AVAILABLE else 0),
-            format_func=lambda m: MARKET_LABEL[m],
-            key="deal_buy_market",
-        )
-    with dm2:
-        ref_options = [m for m in MARKETS_AVAILABLE if m != buy_market]
-        ref_market = st.selectbox(
-            "🏷️ Reference market (sell here)",
-            ref_options,
-            index=(ref_options.index("hk") if "hk" in ref_options else 0),
-            format_func=lambda m: MARKET_LABEL[m],
-            key="deal_ref_market",
-        )
-
-    render_deal_finder(buy_market, ref_market)
-
+with hk_tab:
+    render_market_view("hk")
 
 # ==========================================================================
 # Gaby's want-to-buy list (as he sent it)
 # ==========================================================================
-with tabs[-1]:
+with gaby_tab:
     st.markdown("**What Gaby is looking for, and his budget.**")
     st.table(
         pd.DataFrame(GABY_WTB, columns=["Looking for", "Budget", "Note"])
