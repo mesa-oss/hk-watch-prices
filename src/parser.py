@@ -18,7 +18,7 @@ from typing import Iterator
 
 
 MESSAGE_HEADER = re.compile(
-    r"^‎?\[(\d{2}/\d{2}/\d{4})\s(\d{2}:\d{2}:\d{2})\]\s([^:]+):\s?(.*)$"
+    r"^‎?\[(\d{2}/\d{2}/\d{4}),?\s(\d{2}:\d{2}:\d{2})\]\s([^:]+):\s?(.*)$"  # FR or EN export
 )
 
 WTB_KEYWORDS = (
@@ -1208,10 +1208,21 @@ class ParseResult:
         )
 
 
+# Some dealers break copy-paste with invisible characters inside their prices
+# ('HKD 71\ufeff9K', 'hkd5\u180e60k', 'US\u2060D') and use styled letters
+# ('𝙿𝙰𝚃𝙴𝙺'). Strip the invisibles and fold styled/fullwidth text to plain.
+_INVISIBLE = re.compile("[\u00ad\u034f\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+
+
+def clean_text(text: str) -> str:
+    import unicodedata
+    return _INVISIBLE.sub("", unicodedata.normalize("NFKC", text))
+
+
 def parse_export(path: Path, *, dollar_is_usd: bool = False, since: str | None = None) -> ParseResult:
     """since: ISO date/datetime; messages posted before it are skipped
     (exports always contain the whole chat history)."""
-    text = path.read_text(encoding="utf-8")
+    text = clean_text(path.read_text(encoding="utf-8"))
     result = ParseResult()
     source_file = path.name
 

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from parser import extract_price  # noqa: E402
+from parser import clean_text, extract_price  # noqa: E402
 
 CASES = [
     # --- plain, must keep working ---
@@ -177,6 +177,11 @@ CASES = [
     ("RM07-01 ROM Diamond mop White 2021year $405000U", None, 405_000),
     ("Rm07-01 Bright Night明夜 5/2026 usdt～405k", None, 405_000),
     ("RM65-01 2024 HKD 2,450,000U", None, 2_450_000),
+    ("5821/1A\u2060R NEW FRESH \U0001f4b0 HKD 71\ufeff9K", 719_000, None),
+    ("128159\u180eRBR-0002 2023y fullset hkd5\u180e60k", 560_000, None),
+    ("5271P ONLY WATCH \U0001f4b0 US\u2060D 199K", None, 199_000),
+    ("PP 5116G only watch hkd1\u200b10k", 110_000, None),
+    ("RM07-01 2024 HKD：3.69M", 3_690_000, None),
     ("126333g Black Jub N6 🏷️ $169,5k", 169_500, None),
     ("278383ng white jub n7 204. 5k🏷️", 204_500, None),
     ("26405CE Green,2020-12,330K HKD", 330_000, None),
@@ -206,7 +211,7 @@ def main() -> int:
     for cases, usd in ((CASES, False), (USD_CASES, True)):
         for line, exp_h, exp_u in cases:
             total += 1
-            h, u, _e, _ = extract_price(line, dollar_is_usd=usd)
+            h, u, _e, _ = extract_price(clean_text(line), dollar_is_usd=usd)
             if (h, u) != (exp_h, exp_u):
                 bad += 1
                 print(f"FAIL  {line!r}\n      got hkd={h} usdt={u}  want hkd={exp_h} usdt={exp_u}")

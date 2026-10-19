@@ -23,7 +23,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from parser import extract_price, parse_export  # noqa: E402
+from parser import clean_text, extract_price, parse_export  # noqa: E402
 from db import (connect, insert_listings, mark_export_loaded,  # noqa: E402
                 dedup_repeated_listings, fix_price_scale, fix_currency_labels)
 
@@ -34,7 +34,7 @@ def repair(conn, report) -> None:
     ).fetchall()
     updates, deletes = [], []
     for r in rows:
-        line = r["raw_line"]
+        line = clean_text(r["raw_line"])
         if r["reference"]:
             line = re.sub(re.escape(r["reference"]), " " * len(r["reference"]), line, flags=re.I)
         h, u, e, _ = extract_price(line)

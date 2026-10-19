@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
@@ -151,7 +152,24 @@ def dedup_repeated_listings(conn: sqlite3.Connection) -> tuple[int, int]:
     return before, after
 
 
-def fix_currency_labels(conn: sqlite3.Connection, *, min_peers: int = 5) -> dict:
+def _ref_medians(rows, value, *, min_sellers: int = 5) -> dict:
+    """Market price per reference: median of per-dealer medians, so one dealer
+    re-posting the same typo can't outvote the market. Needs >= min_sellers."""
+    import statistics
+    from collections import defaultdict
+
+    by = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        v = value(row)
+        if v:
+            by[row["ref"]][row["seller"]].append(v)
+    return {
+        ref: statistics.median(statistics.median(v) for v in sellers.values())
+        for ref, sellers in by.items() if len(sellers) >= min_sellers
+    }
+
+
+def fix_currency_labels(conn: sqlite3.Connection) -> dict:
     """Fix HKD/USD mislabels using each reference's HKD market price.
 
     Some dealers write 'USDT 91,000' for a 126300 that trades at HKD 91k
@@ -159,80 +177,101 @@ def fix_currency_labels(conn: sqlite3.Connection, *, min_peers: int = 5) -> dict
     quoted in dollars. Read as labelled, these sit ~7.8x off the market. A
     USDT-only price that matches the HKD median (0.7–1.4x) is moved to HKD; an
     HKD-only price ~7.8x below it that matches once read as USD is moved to USD.
+    The market price is the median of per-dealer medians (>= 5 dealers).
     """
-    import statistics
-    from collections import defaultdict
-
-    hkd_by_ref = defaultdict(list)
     rows = conn.execute(
-        "SELECT id, UPPER(reference), price_hkd, price_usdt, price_eur FROM listings"
+        "SELECT id, UPPER(reference) AS ref, seller, price_hkd AS h, price_usdt AS u, "
+        "price_eur AS e FROM listings"
     ).fetchall()
-    for _id, ref, h, u, e in rows:
-        if h and not u:
-            hkd_by_ref[ref].append(h)
-    med = {r: statistics.median(v) for r, v in hkd_by_ref.items() if len(v) >= min_peers}
+    med = _ref_medians(rows, lambda r: r["h"] if r["h"] and not r["u"] else None)
+    # References that trade in dollars: >= 5 dealers quote them explicitly in
+    # USD/USDT at the same numbers the "HKD"/'$' listings show (5316/50P, RMs).
+    # There the HKD median is really a dollar price, so a USDT quote matching
+    # it is genuine USD — never relabel on these refs.
+    # Dealers who habitually write "USDT" on HKD prices (Lily, Mina…): >= 20
+    # USDT quotes, >= 40% of them sitting at the HKD market price.
+    from collections import Counter
+    looks_hkd, looks_usd = Counter(), Counter()
+    for r in rows:
+        m = med.get(r["ref"])
+        if m and r["u"] and not r["h"]:
+            if 0.7 <= r["u"] / m <= 1.4:
+                looks_hkd[r["seller"]] += 1
+            elif 0.7 <= r["u"] * 7.8 / m <= 1.4:
+                looks_usd[r["seller"]] += 1
+    mislabelers = {d for d in looks_hkd
+                   if looks_hkd[d] + looks_usd[d] >= 20
+                   and looks_hkd[d] / (looks_hkd[d] + looks_usd[d]) >= 0.4}
+    usd_med = _ref_medians(rows, lambda r: r["u"] if r["u"] and not r["h"]
+                           and r["seller"] not in mislabelers else None)
+    dollar_refs = {ref for ref, m in med.items()
+                   if ref in usd_med and 0.75 <= usd_med[ref] / m <= 1.33}
     to_hkd, to_usd = [], []
-    for id_, ref, h, u, e in rows:
-        m = med.get(ref)
-        if not m or e:
+    for r in rows:
+        id_, h, u, e = r["id"], r["h"], r["u"], r["e"]
+        m = med.get(r["ref"])
+        if not m or e or r["ref"] in dollar_refs:
             continue
         if u and not h and 0.7 <= u / m <= 1.4 and u * 7.8 / m > 3:
             to_hkd.append((u, id_))
-        elif h and not u and h / m < 0.2 and 0.75 <= h * 7.8 / m <= 1.33:
+        elif (h and not u and h / m < 0.2 and 0.75 <= h * 7.8 / m <= 1.33
+              # ~1/10 of market could also be a dropped zero: take whichever
+              # reading lands closer (the zero case is left to fix_price_scale)
+              and abs(math.log(h * 7.8 / m)) < abs(math.log(h * 10 / m))):
             to_usd.append((h, id_))
     conn.executemany("UPDATE listings SET price_hkd=?, price_usdt=NULL, "
                      "confidence='ccy-fixed' WHERE id=?", to_hkd)
     conn.executemany("UPDATE listings SET price_usdt=?, price_hkd=NULL, "
                      "confidence='ccy-fixed' WHERE id=?", to_usd)
     conn.commit()
-    return {"usdt_to_hkd": len(to_hkd), "hkd_to_usd": len(to_usd)}
+    return {"usdt_to_hkd": len(to_hkd), "hkd_to_usd": len(to_usd),
+            "dollar_refs": dollar_refs, "mislabelers": mislabelers}
 
 
-def fix_price_scale(conn: sqlite3.Connection, *, min_peers: int = 5) -> dict:
+def fix_price_scale(conn: sqlite3.Connection) -> dict:
     """Correct decimal/scale slips using each reference's own market price.
 
     HK dealers write the same amount many ways ('HKD 9.5k' = 95k for a steel
     Rolex, 'HKD 2.069k' = 2.07M for a Patek, 'HKD 155,000' typed for 1.55M).
-    Text alone can't tell which, but the other listings of that reference can:
-    a listing ~10x / 100x / 1000x BELOW its reference median that lands within
-    0.6–1.6x of it once scaled up is a decimal slip and is rescaled. Prices
-    above the median are never touched (gem-set/Tiffany variants share refs). Listings under HKD 5,000-equivalent that can't be
-    rescaled are removed: no watch in these groups trades that low.
+    Text alone can't tell which, but the other dealers' prices for that
+    reference can: a listing ~10x / 100x / 1000x BELOW the reference median
+    that lands within 0.6–1.6x of it once scaled up is a decimal slip and is
+    rescaled. Prices above the median are never touched (gem-set/Tiffany
+    variants share refs). Listings under HKD 5,000-equivalent, or 20x+ below
+    the median with no decimal explanation, are removed: never a real offer.
     """
-    import statistics
-    from collections import defaultdict
-
     usdt_hkd, eur_hkd = 7.8, 8.5
-    by_ref = defaultdict(list)
-    for id_, ref, h, u, e in conn.execute(
-        "SELECT id, UPPER(reference), price_hkd, price_usdt, price_eur FROM listings"
-    ):
-        v = h or (u * usdt_hkd if u else None) or (e * eur_hkd if e else None)
-        if v:
-            by_ref[ref].append((id_, v, h, u, e))
+    rows = conn.execute(
+        "SELECT id, UPPER(reference) AS ref, seller, price_hkd AS h, price_usdt AS u, "
+        "price_eur AS e FROM listings"
+    ).fetchall()
 
+    def hkd_eq(r):
+        return r["h"] or (r["u"] * usdt_hkd if r["u"] else None) or \
+            (r["e"] * eur_hkd if r["e"] else None)
+
+    med_by_ref = _ref_medians(rows, hkd_eq)
     fixes, drops, examples = [], [], []
-    for ref, items in by_ref.items():
-        med = statistics.median(v for _, v, *_ in items) if len(items) >= min_peers else None
-        for id_, v, h, u, e in items:
-            # Only too-LOW prices are rescaled. A fake-cheap HK price becomes
-            # the "cheapest same-spec" and hides real deals; a too-high one is
-            # ignored by min() anyway, and is often a genuine gem-set/Tiffany
-            # variant sharing the base reference — so those stay untouched.
-            if med and v / med < 0.25:
-                for k in (1, 2, 3):
-                    f = 10 ** k
-                    if 0.6 <= v * f / med <= 1.6:
-                        fixes.append((h and round(h * f), u and round(u * f),
-                                      e and round(e * f), id_))
-                        if len(examples) < 40:
-                            examples.append((ref, med, v, v * f))
-                        v *= f
-                        break
-            if v < 5000 or (med and v / med < 0.05):
-                # under HKD 5k, or 20x+ below its reference with no decimal
-                # explanation ('hkd 8k' for a 418k 5205R): never a real offer
-                drops.append((id_,))
+    for r in rows:
+        v = hkd_eq(r)
+        if not v:
+            continue
+        h, u, e = r["h"], r["u"], r["e"]
+        med = med_by_ref.get(r["ref"])
+        # Only too-LOW prices are rescaled: a fake-cheap HK price becomes the
+        # "cheapest same-spec" and hides real deals; a too-high one is ignored
+        # by min() anyway and is often a genuine variant sharing the ref.
+        if med and v / med < 0.25:
+            for f in (10, 100, 1000):
+                if 0.6 <= v * f / med <= 1.6:
+                    fixes.append((h and round(h * f), u and round(u * f),
+                                  e and round(e * f), r["id"]))
+                    if len(examples) < 40:
+                        examples.append((r["ref"], med, v, v * f))
+                    v *= f
+                    break
+        if v < 5000 or (med and v / med < 0.05):
+            drops.append((r["id"],))
     conn.executemany(
         "UPDATE listings SET price_hkd=?, price_usdt=?, price_eur=?, "
         "confidence='scale-fixed' WHERE id=?", fixes)
